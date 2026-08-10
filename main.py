@@ -170,9 +170,32 @@ class KomariWatchPlugin(Star):
                         if isinstance(raw, dict) and isinstance(raw.get("data"), dict):
                             details = raw["data"]
                             online = raw.get("online", details.keys())
-                            return [{**details[key], "uuid": key} for key in online if key in details and isinstance(details[key], dict)]
+                            result = []
+                            for key in online:
+                                value = details.get(key)
+                                if isinstance(value, str):
+                                    try:
+                                        value = json.loads(value)
+                                    except ValueError:
+                                        value = None
+                                if isinstance(value, dict):
+                                    result.append({**value, "uuid": key})
+                            return result
                         if isinstance(raw, list):
                             return [item for item in raw if isinstance(item, dict)]
+                        # Some older Komari builds return {uuid: metrics} directly.
+                        if isinstance(raw, dict):
+                            mapped = []
+                            for key, value in raw.items():
+                                if isinstance(value, str):
+                                    try:
+                                        value = json.loads(value)
+                                    except ValueError:
+                                        value = None
+                                if isinstance(value, dict) and any(field in value for field in ("cpu", "ram", "memory", "disk")):
+                                    mapped.append({**value, "uuid": key})
+                            if mapped:
+                                return mapped
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError):
             return []
         return []
@@ -195,13 +218,13 @@ class KomariWatchPlugin(Star):
             item: dict[str, Any] = {"uuid": str(uuid), "updated_at": latest.get("time")}
             if latest.get("cpu") is not None:
                 item["cpu_usage"] = latest["cpu"]
-            ram_total = latest.get("ram_total")
+            ram_total = latest.get("ram_total") or node.get("mem_total") or node.get("memory_total")
             if latest.get("ram") is not None:
                 item["ram"] = {"used": latest["ram"], "total": ram_total or 0}
             if latest.get("ram_percent") is not None:
                 item["ram_usage"] = latest["ram_percent"]
             if latest.get("disk") is not None:
-                item["disk"] = {"used": latest["disk"], "total": latest.get("disk_total") or 0}
+                item["disk"] = {"used": latest["disk"], "total": latest.get("disk_total") or node.get("disk_total") or 0}
             if latest.get("disk_percent") is not None:
                 item["disk_usage"] = latest["disk_percent"]
             if latest.get("net_in") is not None or latest.get("net_out") is not None:
@@ -383,8 +406,22 @@ class KomariWatchPlugin(Star):
         if error:
             return [], error
         live = await self._realtime()
+        needs_history = not live or any(_metric(item, "memory") is None or _metric(item, "disk") is None for item in live)
+        history = await self._history_realtime(static) if needs_history else []
         if not live:
-            live = await self._history_realtime(static)
+            live = history
+        elif history:
+            history_by_key = {str(item.get("uuid") or item.get("id")): item for item in history}
+            enriched = []
+            for item in live:
+                key = str(item.get("uuid") or item.get("id") or "")
+                fallback = history_by_key.get(key, {})
+                merged = {**fallback, **item}
+                for section in ("cpu", "ram", "memory", "disk", "storage", "network", "load"):
+                    if isinstance(fallback.get(section), dict) and isinstance(item.get(section), dict):
+                        merged[section] = {**fallback[section], **item[section]}
+                enriched.append(merged)
+            live = enriched
         merged = self._merge_nodes(static, live)
         live_keys = {str(item.get("uuid") or item.get("id")) for item in live}
         for node in merged:
