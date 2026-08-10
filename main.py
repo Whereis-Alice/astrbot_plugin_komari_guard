@@ -2,17 +2,20 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
 import aiohttp
 from pydantic import BaseModel, Field
 
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star, register
 
 PLUGIN_ID = "astrbot_plugin_komari_watch"
@@ -21,6 +24,8 @@ PLUGIN_ID = "astrbot_plugin_komari_watch"
 class KomariWatchConfig(BaseModel):
     komari_url: str = Field("", description="Komari 服务器地址")
     komari_token: str = Field("", description="API Token 或 Session Token")
+    image_output: bool = Field(True, description="以图片卡片发送状态报告")
+    image_width: int = Field(900, ge=500, le=1600, description="状态图片宽度")
     poll_interval: int = Field(60, ge=15, le=3600)
     offline_grace_cycles: int = Field(2, ge=1, le=10)
     cpu_threshold: float = Field(90, ge=1, le=100)
@@ -52,7 +57,7 @@ def _parse_time(value: Any) -> Optional[datetime]:
 def _metric(node: dict[str, Any], name: str) -> Optional[float]:
     aliases = {
         "cpu": ("cpu_usage", "cpu_percent", "cpuUsage", "usage"),
-        "memory": ("memory_usage", "memory_percent", "ram_usage", "mem_usage"),
+        "memory": ("memory_usage", "memory_percent", "ram_usage", "mem_usage", "ram_percent"),
         "disk": ("disk_usage", "disk_percent"),
     }
     for key in aliases[name]:
@@ -158,6 +163,39 @@ class KomariWatchPlugin(Star):
             return []
         return []
 
+    async def _history_realtime(self, nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Fallback for panels where the client WebSocket is disabled by a proxy."""
+        result: list[dict[str, Any]] = []
+        for node in nodes:
+            uuid = node.get("uuid") or node.get("id")
+            if not uuid:
+                continue
+            payload, _ = await self._get_json(f"/api/records/load?uuid={quote(str(uuid))}&hours=1&load_type=all")
+            data = payload.get("data", {}) if payload else {}
+            records = data.get("records", []) if isinstance(data, dict) else []
+            if not isinstance(records, list) or not records:
+                continue
+            latest = max((item for item in records if isinstance(item, dict)), key=lambda item: str(item.get("time", "")), default=None)
+            if not latest:
+                continue
+            item: dict[str, Any] = {"uuid": str(uuid), "updated_at": latest.get("time")}
+            if latest.get("cpu") is not None:
+                item["cpu_usage"] = latest["cpu"]
+            ram_total = latest.get("ram_total")
+            if latest.get("ram") is not None:
+                item["ram"] = {"used": latest["ram"], "total": ram_total or 0}
+            if latest.get("ram_percent") is not None:
+                item["ram_usage"] = latest["ram_percent"]
+            if latest.get("disk") is not None:
+                item["disk"] = {"used": latest["disk"], "total": latest.get("disk_total") or 0}
+            if latest.get("disk_percent") is not None:
+                item["disk_usage"] = latest["disk_percent"]
+            if latest.get("net_in") is not None or latest.get("net_out") is not None:
+                item["network"] = {"down": latest.get("net_in", 0), "up": latest.get("net_out", 0)}
+            item["load"] = {"load1": latest.get("load", "-")}
+            result.append(item)
+        return result
+
     @staticmethod
     def _merge_nodes(static: list[dict[str, Any]], live: list[dict[str, Any]]) -> list[dict[str, Any]]:
         by_key = {str(item.get(key)): item for item in static for key in ("id", "uuid") if item.get(key) is not None}
@@ -185,10 +223,76 @@ class KomariWatchPlugin(Star):
         for node in nodes:
             name = node.get("name") or node.get("hostname") or node.get("id") or "未知节点"
             online = "在线" if node.get("is_online") else "离线"
-            values = ((_metric(node, "cpu"), "CPU"), (_metric(node, "memory"), "内存"), (_metric(node, "disk"), "磁盘"))
-            metrics = " / ".join(f"{label} {value:.1f}%" for value, label in values if value is not None)
+            cpu, memory, disk = _metric(node, "cpu"), _metric(node, "memory"), _metric(node, "disk")
+            metrics = " / ".join(f"{label} {value:.1f}%" for value, label in ((cpu, "CPU"), (memory, "内存"), (disk, "磁盘")) if value is not None)
             lines.append(f"\n{'🟢' if online == '在线' else '🔴'} {name} · {online}{(' · ' + metrics) if metrics else ''}")
         return "\n".join(lines) if len(lines) > 1 else "Komari 没有返回节点。"
+
+    @staticmethod
+    def _fmt_bytes(value: Any) -> str:
+        amount = _num(value)
+        if amount is None:
+            return "-"
+        units = ("B", "KB", "MB", "GB", "TB")
+        index = 0
+        while abs(amount) >= 1024 and index < len(units) - 1:
+            amount /= 1024
+            index += 1
+        return f"{amount:.1f} {units[index]}"
+
+    @staticmethod
+    def _fmt_speed(value: Any) -> str:
+        return f"{KomariWatchPlugin._fmt_bytes(value)}/s"
+
+    @staticmethod
+    def _fmt_uptime(value: Any) -> str:
+        seconds = _num(value)
+        if seconds is None:
+            return "-"
+        days, remainder = divmod(int(seconds), 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes = remainder // 60
+        return f"{days}天 {hours}时 {minutes}分" if days else f"{hours}时 {minutes}分"
+
+    def _report_html(self, nodes: list[dict[str, Any]]) -> str:
+        """Build a self-contained card; no external assets or copied template."""
+        cards: list[str] = []
+        for node in nodes:
+            name = html.escape(str(node.get("name") or node.get("hostname") or node.get("id") or "未知节点"))
+            online = bool(node.get("is_online"))
+            cpu, memory, disk = _metric(node, "cpu"), _metric(node, "memory"), _metric(node, "disk")
+            ram, disk_data = node.get("ram") if isinstance(node.get("ram"), dict) else {}, node.get("disk") if isinstance(node.get("disk"), dict) else {}
+            network = node.get("network") if isinstance(node.get("network"), dict) else {}
+            load = node.get("load") if isinstance(node.get("load"), dict) else {}
+            def progress(label: str, value: Optional[float], color: str) -> str:
+                shown = "-" if value is None else f"{value:.1f}%"
+                width = 0 if value is None else min(max(value, 0), 100)
+                return f'<div class="metric"><div><span>{label}</span><b>{shown}</b></div><i><em style="width:{width}%;background:{color}"></em></i></div>'
+            updated = html.escape(str(node.get("updated_at") or node.get("last_seen") or "等待心跳"))
+            cards.append(f'''<section class="card"><div class="node-head"><div><span class="dot {'online' if online else 'offline'}"></span><strong>{name}</strong></div><small>{'在线' if online else '离线'}</small></div>
+                {progress('CPU', cpu, '#ff6b9d')}{progress('内存', memory, '#8b7bff')}{progress('磁盘', disk, '#22b8cf')}
+                <div class="facts"><span>上行 {html.escape(self._fmt_speed(network.get('up')))}</span><span>下行 {html.escape(self._fmt_speed(network.get('down')))}</span><span>负载 {html.escape(str(load.get('load1', '-')))}</span><span>运行 {html.escape(self._fmt_uptime(node.get('uptime')))}</span></div>
+                <div class="updated">更新时间：{updated}</div></section>''')
+        body = "".join(cards) or '<div class="empty">Komari 没有返回节点数据</div>'
+        return f'''<!doctype html><html><head><meta charset="utf-8"><style>
+        *{{box-sizing:border-box}} body{{width:{self.config.image_width}px;margin:0;padding:28px;background:#d7aabd;font-family:"Microsoft YaHei",sans-serif;color:#392d3b}}
+        .wrap{{background:#f7e7ed;border-radius:24px;padding:26px;box-shadow:0 12px 28px #8f627455}} .top{{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}}
+        .tag{{background:#fff;border-radius:10px;padding:12px 22px;color:#ee6394;font-size:24px;font-weight:700}} .stamp{{background:#25b9e8;color:#fff;border-radius:12px;padding:12px 18px;font-size:18px;font-weight:700}}
+        h1{{font-size:30px;margin:0 0 4px}} .sub{{color:#927f8c;font-size:15px}} .grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}}
+        .card{{background:#fffafc;border-radius:18px;padding:20px;box-shadow:0 3px 10px #9f708522}} .node-head,.metric>div,.facts{{display:flex;justify-content:space-between;align-items:center}} .node-head{{margin-bottom:15px;font-size:21px}} .node-head small{{font-size:14px;color:#8e7c88}} .dot{{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:9px}} .online{{background:#42c88a}} .offline{{background:#f05d74}}
+        .metric{{margin:10px 0}} .metric>div{{font-size:14px;color:#7d6d77}} .metric b{{color:#392d3b}} .metric i{{display:block;height:8px;background:#f1e5ea;border-radius:8px;margin-top:6px;overflow:hidden}} .metric em{{display:block;height:100%;border-radius:8px}} .facts{{flex-wrap:wrap;gap:8px;margin-top:18px;color:#877681;font-size:12px}} .updated{{border-top:1px solid #f0e2e8;margin-top:15px;padding-top:12px;color:#ad9ba4;font-size:11px}} .empty{{padding:40px;text-align:center;color:#927f8c}}
+        </style></head><body><main class="wrap"><div class="top"><span class="tag">Komari 监控</span><span class="stamp">{datetime.now().strftime('%Y-%m-%d %H:%M')}</span></div><h1>服务器运行状态</h1><div class="sub">实时资源概览 · 自动刷新由 AstrBot 监控任务负责</div><div class="grid">{body}</div></main></body></html>'''
+
+    async def _report_result(self, event: AstrMessageEvent, nodes: list[dict[str, Any]]):
+        if not self.config.image_output:
+            return event.plain_result(self._format_report(nodes))
+        try:
+            image_url = await self.html_render(self._report_html(nodes), {"nodes": nodes}, options={"type": "jpeg", "quality": 92, "full_page": True})
+            if image_url:
+                return event.chain_result([Image.fromURL(image_url)])
+        except Exception as exc:
+            self.logger.warning("状态卡片渲染失败，回退文本：%s", exc)
+        return event.plain_result(self._format_report(nodes))
 
     def _can_alert(self, record: dict[str, Any], kind: str, now: float) -> bool:
         """Prevent repeated alerts when a node flaps around a threshold."""
@@ -203,13 +307,10 @@ class KomariWatchPlugin(Star):
                 self.logger.warning("向 %s 推送失败: %s", target, exc)
 
     async def _check_once(self) -> None:
-        static, error = await self._nodes()
+        nodes, error = await self._snapshot()
         if error:
             self.logger.warning(error)
             return
-        live = await self._realtime()
-        live_keys = {str(item.get("uuid") or item.get("id")) for item in live}
-        nodes = self._merge_nodes(static, live)
         now = datetime.now(timezone.utc).timestamp()
         alerts: list[str] = []
         for node in nodes:
@@ -217,7 +318,6 @@ class KomariWatchPlugin(Star):
             record = self.state.setdefault("nodes", {}).setdefault(key, {"offline": 0, "high": 0, "sent": {}, "active": {}})
             record.setdefault("sent", {})
             record.setdefault("active", {})
-            node["is_online"] = self._is_online(node, live_keys)
             record["offline"] = record.get("offline", 0) + 1 if not node["is_online"] else 0
             cpu, mem, disk = _metric(node, "cpu"), _metric(node, "memory"), _metric(node, "disk")
             high = ((cpu is not None and cpu >= self.config.cpu_threshold) or (mem is not None and mem >= self.config.memory_threshold) or (disk is not None and disk >= self.config.disk_threshold))
@@ -264,34 +364,37 @@ class KomariWatchPlugin(Star):
         if self._monitor_task is None or self._monitor_task.done():
             self._monitor_task = asyncio.create_task(self._monitor_loop())
 
+    async def _snapshot(self) -> tuple[list[dict[str, Any]], Optional[str]]:
+        static, error = await self._nodes()
+        if error:
+            return [], error
+        live = await self._realtime()
+        if not live:
+            live = await self._history_realtime(static)
+        merged = self._merge_nodes(static, live)
+        live_keys = {str(item.get("uuid") or item.get("id")) for item in live}
+        for node in merged:
+            node["is_online"] = self._is_online(node, live_keys)
+        return merged, None
+
     @filter.command("komari_status", alias=["kstatus", "komari"])
     async def komari_status(self, event: AstrMessageEvent):
         """查询所有 Komari 节点的状态与资源使用率。"""
         self._start_monitor()
-        nodes, error = await self._nodes()
+        nodes, error = await self._snapshot()
         if error:
             yield event.plain_result(error)
             return
-        live = await self._realtime()
-        merged = self._merge_nodes(nodes, live)
-        live_keys = {str(item.get("uuid") or item.get("id")) for item in live}
-        for node in merged:
-            node["is_online"] = self._is_online(node, live_keys)
-        yield event.plain_result(self._format_report(merged))
+        yield await self._report_result(event, nodes)
 
     @filter.command("komari_realtime", alias=["krealtime", "实时状态"])
     async def komari_realtime(self, event: AstrMessageEvent):
         """查询 Komari WebSocket 实时数据（没有 WebSocket 时回退节点 API）。"""
-        nodes, error = await self._nodes()
+        nodes, error = await self._snapshot()
         if error:
             yield event.plain_result(error)
             return
-        live = await self._realtime()
-        merged = self._merge_nodes(nodes, live)
-        live_keys = {str(item.get("uuid") or item.get("id")) for item in live}
-        for node in merged:
-            node["is_online"] = self._is_online(node, live_keys)
-        yield event.plain_result(self._format_report(merged))
+        yield await self._report_result(event, nodes)
 
     @filter.command("komari_public", alias=["kpublic", "站点信息"])
     async def komari_public(self, event: AstrMessageEvent):

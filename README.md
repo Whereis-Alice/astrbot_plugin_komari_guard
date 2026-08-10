@@ -7,12 +7,12 @@
 
 ## 功能
 
-- `/komari_status`（别名 `/kstatus`、`/komari`）：查询节点在线状态及 CPU/内存/磁盘占用。
+- `/komari_status`（别名 `/kstatus`、`/komari`）：生成状态图片，展示节点在线状态、CPU、内存、磁盘、网络速率、负载与运行时间。
 - `/komari_realtime`、`/komari_public`、`/komari_version`：查询实时数据、公开站点信息和服务端版本。
 - `/komari_bind`：把当前 OneBot 私聊或群聊绑定为告警接收目标。
 - `/komari_unbind`：解除当前会话绑定。
 - `/komari_check`：立即执行一次检查。
-- 后台轮询 `/api/nodes`，并尽力从 `/api/clients` WebSocket 补充实时指标。
+- 后台轮询 `/api/nodes`，优先从 `/api/clients` WebSocket 读取实时指标；WebSocket 被反代禁用时自动使用最近一条负载记录兜底。
 - 节点连续多个周期无心跳才告警；高负载连续多个周期超过阈值才告警；同类告警支持冷却和恢复通知。
 
 ## 安装配置

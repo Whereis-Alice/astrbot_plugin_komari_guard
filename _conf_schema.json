@@ -1,6 +1,8 @@
 {
   "komari_url": {"type": "string", "description": "Komari 服务器地址", "hint": "例如 https://status.example.com", "default": ""},
   "komari_token": {"type": "string", "description": "API Token", "hint": "私有站点填写 API Key 或 Session Token", "default": ""},
+  "image_output": {"type": "bool", "description": "状态以图片发送", "hint": "关闭后使用兼容性更好的纯文本消息", "default": true},
+  "image_width": {"type": "int", "description": "状态图片宽度", "hint": "推荐 800 到 1000 像素", "default": 900, "minimum": 500, "maximum": 1600},
   "poll_interval": {"type": "int", "description": "轮询间隔（秒）", "hint": "建议 60 秒以上", "default": 60, "minimum": 15, "maximum": 3600},
   "offline_grace_cycles": {"type": "int", "description": "离线确认周期", "hint": "连续无心跳多少次才推送离线告警", "default": 2, "minimum": 1, "maximum": 10},
   "cpu_threshold": {"type": "float", "description": "CPU 告警阈值（%）", "default": 90, "minimum": 1, "maximum": 100},
