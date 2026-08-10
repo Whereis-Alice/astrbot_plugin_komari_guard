@@ -56,20 +56,34 @@ def _parse_time(value: Any) -> Optional[datetime]:
 
 def _metric(node: dict[str, Any], name: str) -> Optional[float]:
     aliases = {
-        "cpu": ("cpu_usage", "cpu_percent", "cpuUsage", "usage"),
-        "memory": ("memory_usage", "memory_percent", "ram_usage", "mem_usage", "ram_percent"),
-        "disk": ("disk_usage", "disk_percent"),
+        "cpu": ("cpu_usage", "cpu_percent", "cpuUsage", "cpu_used_percent", "usage"),
+        "memory": ("memory_usage", "memory_percent", "memory_usage_percent", "ram_usage", "ram_percent", "mem_usage", "mem_percent"),
+        "disk": ("disk_usage", "disk_percent", "disk_usage_percent", "storage_percent"),
     }
     for key in aliases[name]:
         value = _num(node.get(key))
         if value is not None:
             return value * 100 if 0 <= value <= 1 else value
-    nested = node.get("cpu") if name == "cpu" else node.get("ram") if name == "memory" else node.get("disk")
-    if isinstance(nested, dict):
-        value = _num(nested.get("usage", nested.get("percent")))
+    containers = {
+        "cpu": (node.get("cpu"),),
+        "memory": (node.get("ram"), node.get("memory"), node.get("mem")),
+        "disk": (node.get("disk"), node.get("storage")),
+    }
+    for nested in containers[name]:
+        if not isinstance(nested, dict):
+            continue
+        value = _num(nested.get("usage", nested.get("percent", nested.get("used_percent", nested.get("percentage")))))
         if value is not None:
             return value * 100 if 0 <= value <= 1 else value
         used, total = _num(nested.get("used")), _num(nested.get("total"))
+        if used is not None and total and total > 0:
+            return used / total * 100
+    pairs = {
+        "memory": (("mem_used", "mem_total"), ("memory_used", "memory_total"), ("ram_used", "ram_total")),
+        "disk": (("disk_used", "disk_total"), ("storage_used", "storage_total")),
+    }
+    for used_key, total_key in pairs.get(name, ()):
+        used, total = _num(node.get(used_key)), _num(node.get(total_key))
         if used is not None and total and total > 0:
             return used / total * 100
     return None
