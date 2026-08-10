@@ -1,0 +1,13 @@
+{
+  "komari_url": {"type": "string", "description": "Komari 服务器地址", "hint": "例如 https://status.example.com", "default": ""},
+  "komari_token": {"type": "string", "description": "API Token", "hint": "私有站点填写 API Key 或 Session Token", "default": ""},
+  "poll_interval": {"type": "int", "description": "轮询间隔（秒）", "hint": "建议 60 秒以上", "default": 60, "minimum": 15, "maximum": 3600},
+  "offline_grace_cycles": {"type": "int", "description": "离线确认周期", "hint": "连续无心跳多少次才推送离线告警", "default": 2, "minimum": 1, "maximum": 10},
+  "cpu_threshold": {"type": "float", "description": "CPU 告警阈值（%）", "default": 90, "minimum": 1, "maximum": 100},
+  "memory_threshold": {"type": "float", "description": "内存告警阈值（%）", "default": 90, "minimum": 1, "maximum": 100},
+  "disk_threshold": {"type": "float", "description": "磁盘告警阈值（%）", "default": 90, "minimum": 1, "maximum": 100},
+  "high_load_cycles": {"type": "int", "description": "高负载确认周期", "hint": "连续超阈值多少次才推送", "default": 2, "minimum": 1, "maximum": 10},
+  "alert_cooldown": {"type": "int", "description": "告警冷却时间（秒）", "default": 1800, "minimum": 0, "maximum": 86400},
+  "notify_recovery": {"type": "bool", "description": "推送恢复通知", "default": true},
+  "request_timeout": {"type": "int", "description": "请求超时（秒）", "default": 10, "minimum": 3, "maximum": 60}
+}
