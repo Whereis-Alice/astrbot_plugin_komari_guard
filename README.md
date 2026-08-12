@@ -23,4 +23,4 @@
 
 ## 开源说明
 
-本项目遵循 MIT License，欢迎提交 Issue 和 Pull Request。发布到 GitHub 时请保留 `metadata.yaml`、`requirements.txt` 与本说明，并在发布前补充实际仓库地址。
+本项目遵循 MIT License，欢迎提交 Issue 和 Pull Request。仓库地址：<https://github.com/xiaowan138/astrbot_plugin_komari_watch>

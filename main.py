@@ -89,7 +89,7 @@ def _metric(node: dict[str, Any], name: str) -> Optional[float]:
     return None
 
 
-@register(PLUGIN_ID, "xiaowan", "Komari 监控推送插件", "1.0.0", "https://github.com/xiaowan/astrbot_plugin_komari_watch")
+@register(PLUGIN_ID, "xiaowan", "Komari 监控推送插件", "1.0.1", "https://github.com/xiaowan138/astrbot_plugin_komari_watch")
 class KomariWatchPlugin(Star):
     """Komari queries plus stateful offline/high-load notifications."""
 
@@ -102,6 +102,7 @@ class KomariWatchPlugin(Star):
         self.state_file = self.state_dir / "state.json"
         self.state = self._load_state()
         self._stop = asyncio.Event()
+        self._check_lock = asyncio.Lock()
         self._monitor_task: Optional[asyncio.Task] = None
         try:
             self._monitor_task = asyncio.get_running_loop().create_task(self._monitor_loop())
@@ -248,12 +249,15 @@ class KomariWatchPlugin(Star):
                 merged.append(dict(item))
         return merged
 
-    def _is_online(self, node: dict[str, Any], live_keys: set[str]) -> bool:
+    def _is_online(self, node: dict[str, Any], live_keys: set[str], history_keys: set[str]) -> bool:
         key = str(node.get("uuid") or node.get("id") or "")
-        if key and key in live_keys:
-            return True
         updated = _parse_time(node.get("updated_at") or node.get("last_seen"))
-        return bool(updated and (datetime.now(timezone.utc) - updated).total_seconds() < self.config.poll_interval * 3)
+        fresh = bool(updated and (datetime.now(timezone.utc) - updated).total_seconds() < self.config.poll_interval * 3)
+        if key and key in live_keys:
+            # WebSocket 在线列表是权威心跳；历史记录兜底时须校验时间新鲜度，
+            # 否则节点死亡后残留的旧记录会把它永远标记为在线，离线告警永不触发。
+            return True if key not in history_keys else fresh
+        return fresh
 
     def _format_report(self, nodes: list[dict[str, Any]]) -> str:
         lines = ["📡 Komari 服务器状态"]
@@ -344,46 +348,49 @@ class KomariWatchPlugin(Star):
                 self.logger.warning("向 %s 推送失败: %s", target, exc)
 
     async def _check_once(self) -> None:
-        nodes, error = await self._snapshot()
-        if error:
-            self.logger.warning(error)
-            return
-        now = datetime.now(timezone.utc).timestamp()
-        alerts: list[str] = []
-        for node in nodes:
-            key = str(node.get("uuid") or node.get("id") or node.get("name") or "unknown")
-            record = self.state.setdefault("nodes", {}).setdefault(key, {"offline": 0, "high": 0, "sent": {}, "active": {}})
-            record.setdefault("sent", {})
-            record.setdefault("active", {})
-            record["offline"] = record.get("offline", 0) + 1 if not node["is_online"] else 0
-            cpu, mem, disk = _metric(node, "cpu"), _metric(node, "memory"), _metric(node, "disk")
-            high = ((cpu is not None and cpu >= self.config.cpu_threshold) or (mem is not None and mem >= self.config.memory_threshold) or (disk is not None and disk >= self.config.disk_threshold))
-            record["high"] = record.get("high", 0) + 1 if high else 0
-            name = node.get("name") or key
-            if (record["offline"] == self.config.offline_grace_cycles
-                    and not record["active"].get("offline")
-                    and self._can_alert(record, "offline", now)):
-                alerts.append(f"🔴 Komari 离线告警\n节点：{name}\n连续 {record['offline']} 个周期未收到心跳。")
-                record["sent"]["offline"] = now
-                record["active"]["offline"] = True
-            elif node["is_online"] and record["active"].get("offline"):
-                if self.config.notify_recovery:
-                    alerts.append(f"🟢 Komari 节点恢复\n节点：{name}")
-                record["active"]["offline"] = False
-            if (record["high"] == self.config.high_load_cycles
-                    and not record["active"].get("high")
-                    and self._can_alert(record, "high", now)):
-                details = ", ".join(f"{label} {value:.1f}%" for value, label in ((cpu, "CPU"), (mem, "内存"), (disk, "磁盘")) if value is not None)
-                alerts.append(f"⚠️ Komari 高负载告警\n节点：{name}\n{details}")
-                record["sent"]["high"] = now
-                record["active"]["high"] = True
-            elif not high and record["active"].get("high"):
-                if self.config.notify_recovery:
-                    alerts.append(f"✅ Komari 负载恢复\n节点：{name}")
-                record["active"]["high"] = False
-        self._save_state()
-        if alerts:
-            await self._send("\n\n".join(alerts))
+        async with self._check_lock:
+            nodes, error = await self._snapshot()
+            if error:
+                self.logger.warning(error)
+                return
+            now = datetime.now(timezone.utc).timestamp()
+            alerts: list[str] = []
+            for node in nodes:
+                key = str(node.get("uuid") or node.get("id") or node.get("name") or "unknown")
+                record = self.state.setdefault("nodes", {}).setdefault(key, {"offline": 0, "high": 0, "sent": {}, "active": {}})
+                record.setdefault("sent", {})
+                record.setdefault("active", {})
+                record["offline"] = record.get("offline", 0) + 1 if not node["is_online"] else 0
+                cpu, mem, disk = _metric(node, "cpu"), _metric(node, "memory"), _metric(node, "disk")
+                high = ((cpu is not None and cpu >= self.config.cpu_threshold) or (mem is not None and mem >= self.config.memory_threshold) or (disk is not None and disk >= self.config.disk_threshold))
+                record["high"] = record.get("high", 0) + 1 if high else 0
+                name = node.get("name") or key
+                # 使用 >= 而非 ==：若触发告警时仍在冷却期内（_can_alert 为 False），
+                # 计数器会继续累加，== 判断将永不再成立，导致本次宕机静默。
+                if (record["offline"] >= self.config.offline_grace_cycles
+                        and not record["active"].get("offline")
+                        and self._can_alert(record, "offline", now)):
+                    alerts.append(f"🔴 Komari 离线告警\n节点：{name}\n连续 {record['offline']} 个周期未收到心跳。")
+                    record["sent"]["offline"] = now
+                    record["active"]["offline"] = True
+                elif node["is_online"] and record["active"].get("offline"):
+                    if self.config.notify_recovery:
+                        alerts.append(f"🟢 Komari 节点恢复\n节点：{name}")
+                    record["active"]["offline"] = False
+                if (record["high"] >= self.config.high_load_cycles
+                        and not record["active"].get("high")
+                        and self._can_alert(record, "high", now)):
+                    details = ", ".join(f"{label} {value:.1f}%" for value, label in ((cpu, "CPU"), (mem, "内存"), (disk, "磁盘")) if value is not None)
+                    alerts.append(f"⚠️ Komari 高负载告警\n节点：{name}\n{details}")
+                    record["sent"]["high"] = now
+                    record["active"]["high"] = True
+                elif not high and record["active"].get("high"):
+                    if self.config.notify_recovery:
+                        alerts.append(f"✅ Komari 负载恢复\n节点：{name}")
+                    record["active"]["high"] = False
+            self._save_state()
+            if alerts:
+                await self._send("\n\n".join(alerts))
 
     async def _monitor_loop(self) -> None:
         try:
@@ -408,6 +415,7 @@ class KomariWatchPlugin(Star):
         live = await self._realtime()
         needs_history = not live or any(_metric(item, "memory") is None or _metric(item, "disk") is None for item in live)
         history = await self._history_realtime(static) if needs_history else []
+        history_keys = {str(item.get("uuid") or item.get("id")) for item in history}
         if not live:
             live = history
         elif history:
@@ -425,7 +433,7 @@ class KomariWatchPlugin(Star):
         merged = self._merge_nodes(static, live)
         live_keys = {str(item.get("uuid") or item.get("id")) for item in live}
         for node in merged:
-            node["is_online"] = self._is_online(node, live_keys)
+            node["is_online"] = self._is_online(node, live_keys, history_keys)
         return merged, None
 
     @filter.command("komari_status", alias=["kstatus", "komari"])
