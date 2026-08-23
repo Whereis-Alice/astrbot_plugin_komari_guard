@@ -7,8 +7,8 @@
 
 ## 功能
 
-- `/komari_status`（别名 `/kstatus`、`/komari`）：生成状态图片，展示节点在线状态、CPU、内存、磁盘、网络速率、负载与运行时间。
-- `/komari_realtime`、`/komari_public`、`/komari_version`：查询实时数据、公开站点信息和服务端版本。
+- `/komari_status`（别名 `/kstatus`、`/komari`）：生成状态图片，展示节点在线状态、CPU、内存、磁盘、网络速率、负载与运行时间；可加节点名只看指定节点，如 `/komari_status node01`。
+- `/komari_realtime`、`/komari_public`、`/komari_version`：查询实时数据（不经历史兜底）、公开站点信息和服务端版本。
 - `/komari_bind`：把当前 OneBot 私聊或群聊绑定为告警接收目标。
 - `/komari_unbind`：解除当前会话绑定。
 - `/komari_check`：立即执行一次检查。
@@ -18,6 +18,12 @@
 ## 安装配置
 
 在 AstrBot 插件配置页面填写 Komari 地址，私有站点再填写 Token。按需调整轮询间隔、离线确认周期、CPU/内存/磁盘阈值等。启动后在目标 OneBot 群里发送 `/komari_bind` 即可接收推送；绑定信息保存于 AstrBot 的 `data/plugin_data/astrbot_plugin_komari_watch/state.json`。
+
+支持的可选配置：
+- `filter_mode` / `filter_nodes`：节点过滤。`filter_mode` 为 `none`（默认，不过滤）、`allow`（只监控列表中节点）或 `deny`（排除列表中节点）；`filter_nodes` 填写节点名，多个用英文逗号分隔，支持子串匹配（匹配名称、主机名、id、uuid）。
+- `status_report_interval`：定时状态推送间隔（小时），大于 0 时后台监控会按该间隔向绑定会话推送状态卡片，0 表示关闭。
+- `prune_missing_cycles`：节点从服务器消失多少周期后清理其监控状态，防止 `state.json` 无限增长。
+- `notify_recovery`：关闭后不再推送恢复通知（其余保持不变）。
 
 建议先用 `/komari_check` 验证 API 与权限，再开启较短的轮询周期。Token 只保存在 AstrBot 配置中，不会写入日志。
 

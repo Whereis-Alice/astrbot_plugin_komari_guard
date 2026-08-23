@@ -6,6 +6,7 @@ import html
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -19,6 +20,8 @@ from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star, register
 
 PLUGIN_ID = "astrbot_plugin_komari_watch"
+
+_MSG_TYPES = aiohttp.WSMsgType
 
 
 class KomariWatchConfig(BaseModel):
@@ -35,6 +38,10 @@ class KomariWatchConfig(BaseModel):
     alert_cooldown: int = Field(1800, ge=0, le=86400)
     notify_recovery: bool = True
     request_timeout: int = Field(10, ge=3, le=60)
+    filter_mode: str = Field("none", pattern="^(none|allow|deny)$", description="节点过滤：none/allow(仅监控)/deny(排除)")
+    filter_nodes: str = Field("", description="要过滤的节点名，多个用英文逗号分隔")
+    status_report_interval: int = Field(0, ge=0, le=720, description="定时状态推送间隔（小时），0 表示关闭")
+    prune_missing_cycles: int = Field(5, ge=1, le=100, description="节点消失多少周期后清理其监控状态")
 
 
 def _num(value: Any) -> Optional[float]:
@@ -89,7 +96,7 @@ def _metric(node: dict[str, Any], name: str) -> Optional[float]:
     return None
 
 
-@register(PLUGIN_ID, "xiaowan", "Komari 监控推送插件", "1.0.1", "https://github.com/xiaowan138/astrbot_plugin_komari_watch")
+@register(PLUGIN_ID, "xiaowan", "Komari 监控推送插件", "1.1.0", "https://github.com/xiaowan138/astrbot_plugin_komari_watch")
 class KomariWatchPlugin(Star):
     """Komari queries plus stateful offline/high-load notifications."""
 
@@ -103,6 +110,7 @@ class KomariWatchPlugin(Star):
         self.state = self._load_state()
         self._stop = asyncio.Event()
         self._check_lock = asyncio.Lock()
+        self._session: Optional[aiohttp.ClientSession] = None
         self._monitor_task: Optional[asyncio.Task] = None
         try:
             self._monitor_task = asyncio.get_running_loop().create_task(self._monitor_loop())
@@ -130,18 +138,23 @@ class KomariWatchPlugin(Star):
             return {}
         return {"Authorization": f"Bearer {self.config.komari_token}", "Cookie": f"session_token={self.config.komari_token}"}
 
+    async def _session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=self.config.request_timeout)
+            self._session = aiohttp.ClientSession(timeout=timeout, headers=self._headers())
+        return self._session
+
     async def _get_json(self, endpoint: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
         if not self.config.komari_url:
             return None, "请先在插件配置中填写 Komari 服务器地址。"
         try:
-            timeout = aiohttp.ClientTimeout(total=self.config.request_timeout)
-            async with aiohttp.ClientSession(timeout=timeout, headers=self._headers()) as session:
-                async with session.get(self.config.komari_url.rstrip("/") + endpoint) as response:
-                    if response.status != 200:
-                        return None, f"Komari API 返回 HTTP {response.status}"
-                    payload = await response.json(content_type=None)
-                    return payload if isinstance(payload, dict) else None, None
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            session = await self._session()
+            async with session.get(self.config.komari_url.rstrip("/") + endpoint) as response:
+                if response.status != 200:
+                    return None, f"Komari API 返回 HTTP {response.status}"
+                payload = await response.json(content_type=None)
+                return payload if isinstance(payload, dict) else None, None
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
             return None, f"连接 Komari 失败：{exc}"
 
     async def _nodes(self) -> tuple[list[dict[str, Any]], Optional[str]]:
@@ -153,86 +166,129 @@ class KomariWatchPlugin(Star):
             raw = raw.get("nodes", raw.get("servers", list(raw.values())))
         return ([item for item in raw if isinstance(item, dict)], None) if isinstance(raw, list) else ([], None)
 
+    @staticmethod
+    def _ws_bytes(data: Any) -> bytes:
+        if isinstance(data, bytes):
+            return data
+        if isinstance(data, bytearray):
+            return bytes(data)
+        return str(data).encode("utf-8", "replace")
+
+    async def _read_ws_payload(self, ws: aiohttp.ClientWebSocketResponse, timeout: float = 6.0) -> Optional[str]:
+        """Read a single complete WS payload, tolerating binary frames, pings and
+        (defensively) fragmented frames instead of stopping after a fixed count."""
+        parts: list[bytes] = []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                message = await asyncio.wait_for(ws.receive(), timeout=deadline - time.monotonic())
+            except asyncio.TimeoutError:
+                break
+            if message.type == _MSG_TYPES.CONTINUATION:
+                parts.append(self._ws_bytes(message.data))
+                continue
+            if message.type in (_MSG_TYPES.TEXT, _MSG_TYPES.BINARY):
+                if isinstance(message.data, str):
+                    text: Optional[str] = message.data
+                else:
+                    text = self._ws_bytes(message.data).decode("utf-8", "replace")
+                if not text:
+                    continue
+                if parts:
+                    text = "".join(p.decode("utf-8", "replace") for p in parts) + text
+                return text
+            if message.type in (_MSG_TYPES.CLOSED, _MSG_TYPES.CLOSE, _MSG_TYPES.ERROR):
+                break
+            # ignore PING / PONG
+        return None
+
     async def _realtime(self) -> list[dict[str, Any]]:
         if not self.config.komari_url:
             return []
         ws_url = re.sub(r"^http", "ws", self.config.komari_url.rstrip("/")) + "/api/clients"
         try:
-            timeout = aiohttp.ClientTimeout(total=min(self.config.request_timeout, 10))
-            async with aiohttp.ClientSession(timeout=timeout, headers=self._headers()) as session:
-                async with session.ws_connect(ws_url, heartbeat=10) as ws:
-                    await ws.send_str("get")
-                    for _ in range(3):
-                        message = await ws.receive(timeout=3)
-                        if message.type != aiohttp.WSMsgType.TEXT:
-                            continue
-                        payload = json.loads(message.data)
-                        raw = payload.get("data", payload) if isinstance(payload, dict) else payload
-                        if isinstance(raw, dict) and isinstance(raw.get("data"), dict):
-                            details = raw["data"]
-                            online = raw.get("online", details.keys())
-                            result = []
-                            for key in online:
-                                value = details.get(key)
-                                if isinstance(value, str):
-                                    try:
-                                        value = json.loads(value)
-                                    except ValueError:
-                                        value = None
-                                if isinstance(value, dict):
-                                    result.append({**value, "uuid": key})
-                            return result
-                        if isinstance(raw, list):
-                            return [item for item in raw if isinstance(item, dict)]
-                        # Some older Komari builds return {uuid: metrics} directly.
-                        if isinstance(raw, dict):
-                            mapped = []
-                            for key, value in raw.items():
-                                if isinstance(value, str):
-                                    try:
-                                        value = json.loads(value)
-                                    except ValueError:
-                                        value = None
-                                if isinstance(value, dict) and any(field in value for field in ("cpu", "ram", "memory", "disk")):
-                                    mapped.append({**value, "uuid": key})
-                            if mapped:
-                                return mapped
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError):
+            session = await self._session()
+            ws_timeout = aiohttp.ClientTimeout(total=min(self.config.request_timeout, 15))
+            async with session.ws_connect(ws_url, heartbeat=10, timeout=ws_timeout) as ws:
+                await ws.send_str("get")
+                text = await self._read_ws_payload(ws)
+                if not text:
+                    return []
+                payload = json.loads(text)
+                raw = payload.get("data", payload) if isinstance(payload, dict) else payload
+                if isinstance(raw, dict) and isinstance(raw.get("data"), dict):
+                    details = raw["data"]
+                    online = raw.get("online", details.keys())
+                    result = []
+                    for key in online:
+                        value = details.get(key)
+                        if isinstance(value, str):
+                            try:
+                                value = json.loads(value)
+                            except ValueError:
+                                value = None
+                        if isinstance(value, dict):
+                            result.append({**value, "uuid": key})
+                    return result
+                if isinstance(raw, list):
+                    return [item for item in raw if isinstance(item, dict)]
+                # Some older Komari builds return {uuid: metrics} directly.
+                if isinstance(raw, dict):
+                    mapped = []
+                    for key, value in raw.items():
+                        if isinstance(value, str):
+                            try:
+                                value = json.loads(value)
+                            except ValueError:
+                                value = None
+                        if isinstance(value, dict) and any(field in value for field in ("cpu", "ram", "memory", "disk")):
+                            mapped.append({**value, "uuid": key})
+                    if mapped:
+                        return mapped
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, KeyError):
             return []
         return []
 
+    async def _history_one(self, node: dict[str, Any]) -> Optional[dict[str, Any]]:
+        uuid = node.get("uuid") or node.get("id")
+        if not uuid:
+            return None
+        try:
+            payload, _ = await self._get_json(f"/api/records/load?uuid={quote(str(uuid))}&hours=1&load_type=all")
+        except Exception as exc:
+            self.logger.debug("读取 %s 历史记录失败: %s", uuid, exc)
+            return None
+        data = payload.get("data", {}) if payload else {}
+        records = data.get("records", []) if isinstance(data, dict) else []
+        if not isinstance(records, list) or not records:
+            return None
+        latest = max((item for item in records if isinstance(item, dict)), key=lambda item: str(item.get("time", "")), default=None)
+        if not latest:
+            return None
+        item: dict[str, Any] = {"uuid": str(uuid), "updated_at": latest.get("time")}
+        if latest.get("cpu") is not None:
+            item["cpu_usage"] = latest["cpu"]
+        ram_total = latest.get("ram_total") or node.get("mem_total") or node.get("memory_total")
+        if latest.get("ram") is not None:
+            item["ram"] = {"used": latest["ram"], "total": ram_total or 0}
+        if latest.get("ram_percent") is not None:
+            item["ram_usage"] = latest["ram_percent"]
+        if latest.get("disk") is not None:
+            item["disk"] = {"used": latest["disk"], "total": latest.get("disk_total") or node.get("disk_total") or 0}
+        if latest.get("disk_percent") is not None:
+            item["disk_usage"] = latest["disk_percent"]
+        if latest.get("net_in") is not None or latest.get("net_out") is not None:
+            item["network"] = {"down": latest.get("net_in", 0), "up": latest.get("net_out", 0)}
+        item["load"] = {"load1": latest.get("load", "-")}
+        return item
+
     async def _history_realtime(self, nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Fallback for panels where the client WebSocket is disabled by a proxy."""
-        result: list[dict[str, Any]] = []
-        for node in nodes:
-            uuid = node.get("uuid") or node.get("id")
-            if not uuid:
-                continue
-            payload, _ = await self._get_json(f"/api/records/load?uuid={quote(str(uuid))}&hours=1&load_type=all")
-            data = payload.get("data", {}) if payload else {}
-            records = data.get("records", []) if isinstance(data, dict) else []
-            if not isinstance(records, list) or not records:
-                continue
-            latest = max((item for item in records if isinstance(item, dict)), key=lambda item: str(item.get("time", "")), default=None)
-            if not latest:
-                continue
-            item: dict[str, Any] = {"uuid": str(uuid), "updated_at": latest.get("time")}
-            if latest.get("cpu") is not None:
-                item["cpu_usage"] = latest["cpu"]
-            ram_total = latest.get("ram_total") or node.get("mem_total") or node.get("memory_total")
-            if latest.get("ram") is not None:
-                item["ram"] = {"used": latest["ram"], "total": ram_total or 0}
-            if latest.get("ram_percent") is not None:
-                item["ram_usage"] = latest["ram_percent"]
-            if latest.get("disk") is not None:
-                item["disk"] = {"used": latest["disk"], "total": latest.get("disk_total") or node.get("disk_total") or 0}
-            if latest.get("disk_percent") is not None:
-                item["disk_usage"] = latest["disk_percent"]
-            if latest.get("net_in") is not None or latest.get("net_out") is not None:
-                item["network"] = {"down": latest.get("net_in", 0), "up": latest.get("net_out", 0)}
-            item["load"] = {"load1": latest.get("load", "-")}
-            result.append(item)
-        return result
+        tasks = [self._history_one(node) for node in nodes if node.get("uuid") or node.get("id")]
+        if not tasks:
+            return []
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [item for item in results if isinstance(item, dict)]
 
     @staticmethod
     def _merge_nodes(static: list[dict[str, Any]], live: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -290,10 +346,24 @@ class KomariWatchPlugin(Star):
         seconds = _num(value)
         if seconds is None:
             return "-"
-        days, remainder = divmod(int(seconds), 86400)
+        return KomariWatchPlugin._fmt_duration(seconds)
+
+    @staticmethod
+    def _fmt_duration(value: Any) -> str:
+        seconds = _num(value)
+        if seconds is None:
+            return "-"
+        seconds = max(0, int(seconds))
+        days, remainder = divmod(seconds, 86400)
         hours, remainder = divmod(remainder, 3600)
         minutes = remainder // 60
-        return f"{days}天 {hours}时 {minutes}分" if days else f"{hours}时 {minutes}分"
+        parts = []
+        if days:
+            parts.append(f"{days}天")
+        if hours:
+            parts.append(f"{hours}时")
+        parts.append(f"{minutes}分")
+        return "".join(parts)
 
     def _report_html(self, nodes: list[dict[str, Any]]) -> str:
         """Build a self-contained card; no external assets or copied template."""
@@ -324,16 +394,48 @@ class KomariWatchPlugin(Star):
         .metric{{margin:10px 0}} .metric>div{{font-size:14px;color:#7d6d77}} .metric b{{color:#392d3b}} .metric i{{display:block;height:8px;background:#f1e5ea;border-radius:8px;margin-top:6px;overflow:hidden}} .metric em{{display:block;height:100%;border-radius:8px}} .facts{{flex-wrap:wrap;gap:8px;margin-top:18px;color:#877681;font-size:12px}} .updated{{border-top:1px solid #f0e2e8;margin-top:15px;padding-top:12px;color:#ad9ba4;font-size:11px}} .empty{{padding:40px;text-align:center;color:#927f8c}}
         </style></head><body><main class="wrap"><div class="top"><span class="tag">Komari 监控</span><span class="stamp">{datetime.now().strftime('%Y-%m-%d %H:%M')}</span></div><h1>服务器运行状态</h1><div class="sub">实时资源概览 · 自动刷新由 AstrBot 监控任务负责</div><div class="grid">{body}</div></main></body></html>'''
 
-    async def _report_result(self, event: AstrMessageEvent, nodes: list[dict[str, Any]]):
+    async def _report_chain(self, nodes: list[dict[str, Any]]) -> MessageChain:
+        """Build a status message (image or text) usable for replies and background pushes."""
         if not self.config.image_output:
-            return event.plain_result(self._format_report(nodes))
+            return MessageChain().message(self._format_report(nodes))
         try:
             image_url = await self.html_render(self._report_html(nodes), {"nodes": nodes}, options={"type": "jpeg", "quality": 92, "full_page": True})
             if image_url:
-                return event.chain_result([Image.fromURL(image_url)])
+                return MessageChain([Image.fromURL(image_url)])
         except Exception as exc:
             self.logger.warning("状态卡片渲染失败，回退文本：%s", exc)
-        return event.plain_result(self._format_report(nodes))
+        return MessageChain().message(self._format_report(nodes))
+
+    async def _report_result(self, event: AstrMessageEvent, nodes: list[dict[str, Any]]):
+        if not nodes:
+            return event.plain_result("Komari 没有返回节点。")
+        return event.chain_result(await self._report_chain(nodes))
+
+    # ---- 节点过滤 / 选择 ----
+
+    @staticmethod
+    def _node_idents(node: dict[str, Any]) -> list[str]:
+        return [str(node.get(key) or "").lower() for key in ("name", "hostname", "id", "uuid") if node.get(key)]
+
+    def _filter_tokens(self) -> list[str]:
+        return [t.strip().lower() for t in (self.config.filter_nodes or "").split(",") if t.strip()]
+
+    def _monitored(self, node: dict[str, Any]) -> bool:
+        mode = self.config.filter_mode
+        if mode == "none":
+            return True
+        idents = self._node_idents(node)
+        hit = any(any(token in ident for ident in idents) for token in self._filter_tokens())
+        return hit if mode == "allow" else (not hit)
+
+    def _visible(self, nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [node for node in nodes if self._monitored(node)]
+
+    def _select(self, nodes: list[dict[str, Any]], args: tuple[Any, ...]) -> list[dict[str, Any]]:
+        if not args or not str(args[0]):
+            return nodes
+        keyword = str(args[0]).lower()
+        return [node for node in nodes if any(keyword in value for value in self._node_idents(node))]
 
     def _can_alert(self, record: dict[str, Any], kind: str, now: float) -> bool:
         """Prevent repeated alerts when a node flaps around a threshold."""
@@ -347,6 +449,41 @@ class KomariWatchPlugin(Star):
             except Exception as exc:
                 self.logger.warning("向 %s 推送失败: %s", target, exc)
 
+    async def _send_chain(self, chain: MessageChain) -> None:
+        for target in self._targets():
+            try:
+                await self.context.send_message(target, chain)
+            except Exception as exc:
+                self.logger.warning("向 %s 推送失败: %s", target, exc)
+
+    async def _maybe_status_push(self, nodes: list[dict[str, Any]], now: float) -> None:
+        if self.config.status_report_interval <= 0:
+            return
+        last = _num(self.state.get("last_status_report"))
+        if last is not None and now - last < self.config.status_report_interval * 3600:
+            return
+        visible = self._visible(nodes)
+        if not visible:
+            return
+        chain = await self._report_chain(visible)
+        await self._send_chain(chain)
+        self.state["last_status_report"] = now
+        self._save_state()
+
+    def _prune_missing(self, known_keys: set[str]) -> None:
+        nodes = self.state.get("nodes")
+        if not isinstance(nodes, dict):
+            return
+        for key in list(nodes.keys()):
+            record = nodes[key]
+            if key in known_keys:
+                record["missing"] = 0
+                continue
+            missing = record.get("missing", 0) + 1
+            record["missing"] = missing
+            if missing >= self.config.prune_missing_cycles:
+                del nodes[key]
+
     async def _check_once(self) -> None:
         async with self._check_lock:
             nodes, error = await self._snapshot()
@@ -354,28 +491,37 @@ class KomariWatchPlugin(Star):
                 self.logger.warning(error)
                 return
             now = datetime.now(timezone.utc).timestamp()
+            known_keys: set[str] = set()
             alerts: list[str] = []
             for node in nodes:
                 key = str(node.get("uuid") or node.get("id") or node.get("name") or "unknown")
+                known_keys.add(key)
+                if not self._monitored(node):
+                    continue
                 record = self.state.setdefault("nodes", {}).setdefault(key, {"offline": 0, "high": 0, "sent": {}, "active": {}})
                 record.setdefault("sent", {})
                 record.setdefault("active", {})
-                record["offline"] = record.get("offline", 0) + 1 if not node["is_online"] else 0
+                is_online = bool(node["is_online"])
+                record["offline"] = record.get("offline", 0) + 1 if not is_online else 0
                 cpu, mem, disk = _metric(node, "cpu"), _metric(node, "memory"), _metric(node, "disk")
-                high = ((cpu is not None and cpu >= self.config.cpu_threshold) or (mem is not None and mem >= self.config.memory_threshold) or (disk is not None and disk >= self.config.disk_threshold))
+                # 离线节点的指标可能是陈旧历史值，跳过其高负载告警，避免死节点误报。
+                high = is_online and ((cpu is not None and cpu >= self.config.cpu_threshold) or (mem is not None and mem >= self.config.memory_threshold) or (disk is not None and disk >= self.config.disk_threshold))
                 record["high"] = record.get("high", 0) + 1 if high else 0
                 name = node.get("name") or key
                 # 使用 >= 而非 ==：若触发告警时仍在冷却期内（_can_alert 为 False），
                 # 计数器会继续累加，== 判断将永不再成立，导致本次宕机静默。
-                if (record["offline"] >= self.config.offline_grace_cycles
+                if (not is_online
+                        and record["offline"] >= self.config.offline_grace_cycles
                         and not record["active"].get("offline")
                         and self._can_alert(record, "offline", now)):
                     alerts.append(f"🔴 Komari 离线告警\n节点：{name}\n连续 {record['offline']} 个周期未收到心跳。")
                     record["sent"]["offline"] = now
                     record["active"]["offline"] = True
-                elif node["is_online"] and record["active"].get("offline"):
+                    record["offline_started"] = now
+                elif is_online and record["active"].get("offline"):
                     if self.config.notify_recovery:
-                        alerts.append(f"🟢 Komari 节点恢复\n节点：{name}")
+                        duration = self._fmt_duration(now - record.get("offline_started", now))
+                        alerts.append(f"🟢 Komari 节点恢复\n节点：{name}\n离线时长：{duration}")
                     record["active"]["offline"] = False
                 if (record["high"] >= self.config.high_load_cycles
                         and not record["active"].get("high")
@@ -384,13 +530,18 @@ class KomariWatchPlugin(Star):
                     alerts.append(f"⚠️ Komari 高负载告警\n节点：{name}\n{details}")
                     record["sent"]["high"] = now
                     record["active"]["high"] = True
+                    record["high_started"] = now
                 elif not high and record["active"].get("high"):
                     if self.config.notify_recovery:
-                        alerts.append(f"✅ Komari 负载恢复\n节点：{name}")
+                        duration = self._fmt_duration(now - record.get("high_started", now))
+                        alerts.append(f"✅ Komari 负载恢复\n节点：{name}\n持续时长：{duration}")
                     record["active"]["high"] = False
+            self._prune_missing(known_keys)
             self._save_state()
             if alerts:
                 await self._send("\n\n".join(alerts))
+            if self.config.status_report_interval > 0:
+                await self._maybe_status_push(nodes, now)
 
     async def _monitor_loop(self) -> None:
         try:
@@ -437,23 +588,31 @@ class KomariWatchPlugin(Star):
         return merged, None
 
     @filter.command("komari_status", alias=["kstatus", "komari"])
-    async def komari_status(self, event: AstrMessageEvent):
-        """查询所有 Komari 节点的状态与资源使用率。"""
+    async def komari_status(self, event: AstrMessageEvent, *args):
+        """查询所有 Komari 节点的状态与资源使用率；可加节点名（支持子串）只看指定节点。"""
         self._start_monitor()
         nodes, error = await self._snapshot()
         if error:
             yield event.plain_result(error)
             return
-        yield await self._report_result(event, nodes)
+        yield await self._report_result(event, self._visible(self._select(nodes, args)))
 
     @filter.command("komari_realtime", alias=["krealtime", "实时状态"])
-    async def komari_realtime(self, event: AstrMessageEvent):
-        """查询 Komari WebSocket 实时数据（没有 WebSocket 时回退节点 API）。"""
-        nodes, error = await self._snapshot()
+    async def komari_realtime(self, event: AstrMessageEvent, *args):
+        """查询 Komari WebSocket 实时数据（不经历史兜底）；WebSocket 不可用时提示改用状态命令。"""
+        self._start_monitor()
+        live = await self._realtime()
+        if not live:
+            yield event.plain_result("WebSocket 实时通道暂时不可用（可能被反代禁用），请改用 /komari_status 查看状态报告。")
+            return
+        static, error = await self._nodes()
         if error:
             yield event.plain_result(error)
             return
-        yield await self._report_result(event, nodes)
+        merged = self._merge_nodes(static, live)
+        for node in merged:
+            node["is_online"] = True
+        yield await self._report_result(event, self._visible(self._select(merged, args)))
 
     @filter.command("komari_public", alias=["kpublic", "站点信息"])
     async def komari_public(self, event: AstrMessageEvent):
@@ -514,7 +673,13 @@ class KomariWatchPlugin(Star):
         self._stop.set()
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
-            await self._monitor_task
+            try:
+                await self._monitor_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
 
 __all__ = ["KomariWatchPlugin", "KomariWatchConfig"]

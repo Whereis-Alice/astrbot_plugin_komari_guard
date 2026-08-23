@@ -11,5 +11,9 @@
   "high_load_cycles": {"type": "int", "description": "高负载确认周期", "hint": "连续超阈值多少次才推送", "default": 2, "minimum": 1, "maximum": 10},
   "alert_cooldown": {"type": "int", "description": "告警冷却时间（秒）", "default": 1800, "minimum": 0, "maximum": 86400},
   "notify_recovery": {"type": "bool", "description": "推送恢复通知", "default": true},
-  "request_timeout": {"type": "int", "description": "请求超时（秒）", "default": 10, "minimum": 3, "maximum": 60}
+  "request_timeout": {"type": "int", "description": "请求超时（秒）", "default": 10, "minimum": 3, "maximum": 60},
+  "filter_mode": {"type": "string", "description": "节点过滤模式", "hint": "none=不过滤；allow=只监控列表中节点；deny=排除列表中节点", "default": "none"},
+  "filter_nodes": {"type": "string", "description": "过滤/白名单节点", "hint": "节点名，多个用英文逗号分隔，支持子串匹配", "default": ""},
+  "status_report_interval": {"type": "int", "description": "定时状态推送间隔（小时）", "hint": "大于 0 时按该间隔向绑定会话推送状态卡片，0 表示关闭", "default": 0, "minimum": 0, "maximum": 720},
+  "prune_missing_cycles": {"type": "int", "description": "节点清理周期", "hint": "节点从服务器消失多少周期后清理其监控状态", "default": 5, "minimum": 1, "maximum": 100}
 }
