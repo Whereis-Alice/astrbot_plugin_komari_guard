@@ -7,11 +7,13 @@
 
 ## 功能
 
-- `/komari_status`（别名 `/kstatus`、`/komari`）：生成状态图片，展示节点在线状态、CPU、内存、磁盘、网络速率、负载与运行时间；可加节点名只看指定节点，如 `/komari_status node01`。
+- `/komari_status`（别名 `/kstatus`、`/komari`）：生成状态图片，展示节点在线状态、CPU、内存、磁盘、网络速率、负载与运行时间；可加节点名只看指定节点，如 `/komari_status node01`。卡片头部附"共/在线/离线"统计。
 - `/komari_realtime`、`/komari_public`、`/komari_version`：查询实时数据（不经历史兜底）、公开站点信息和服务端版本。
-- `/komari_history`（别名 `/khistory`、`/历史`）：查询历史资源趋势曲线，可带小时数如 `/komari_history 6`（1-24 小时）。
+- `/komari_history`（别名 `/khistory`、`/历史`）：查询历史资源趋势曲线，如 `/komari_history 6 nodeA`（小时数 1-24，可加节点名过滤）。
+- `/komari_nodes`（别名 `/knodes`）：列出全部节点名称及过滤排除情况，便于填写 `filter_nodes` 与查询参数。
 - `/komari_alerts`（别名 `/kalerts`）：查看最近的一批告警记录。
-- `/komari_mute <分钟>`：临时静默告警（默认 30 分钟），`/komari_unmute` 提前恢复。
+- `/komari_mute <分钟> [all]`：临时静默告警（默认 30 分钟；默认只静默当前会话，加 `all` 静默全部绑定会话）；`/komari_unmute [all]` 提前恢复。
+- `/komari_help`（别名 `/khelp`）：全部命令总览。
 - `/komari_bind`：把当前 OneBot 私聊或群聊绑定为告警接收目标。
 - `/komari_unbind`：解除当前会话绑定。
 - `/komari_check`：立即执行一次检查。
@@ -26,6 +28,7 @@
 支持的可选配置：
 - `filter_mode` / `filter_nodes`：节点过滤。`filter_mode` 为 `none`（默认，不过滤）、`allow`（只监控列表中节点）或 `deny`（排除列表中节点）；`filter_nodes` 填写节点名，多个用英文逗号分隔，支持子串匹配（匹配名称、主机名、id、uuid）。
 - `status_report_interval`：定时状态推送间隔（小时），大于 0 时后台监控会按该间隔向绑定会话推送状态卡片，0 表示关闭。
+- `status_report_time`：每天固定时刻（本地时间 `HH:MM`，如 `09:00`）推送状态卡片，留空不启用；可与间隔推送共存，先到先推。
 - `prune_missing_cycles`：节点从服务器消失多少周期后清理其监控状态，防止 `state.json` 无限增长。
 - `notify_recovery`：关闭后不再推送恢复通知（其余保持不变）。
 
