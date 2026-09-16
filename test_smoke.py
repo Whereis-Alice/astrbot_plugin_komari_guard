@@ -27,7 +27,13 @@ def _mock_astrbot() -> type:
     star_mod = types.ModuleType("astrbot.api.star")
 
     class AstrBotConfig(dict):
-        pass
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.save_calls = 0
+
+        async def save_config_async(self):
+            self.save_calls += 1
+            return True
 
     class Plain:
         def __init__(self, text: str):
@@ -327,6 +333,93 @@ async def run() -> None:
     results = await collect(plugin.cmd_bind(FakeEvent(), "node1", "09:00", "daily"))
     command_routes = [route for route in plugin.state["routes"] if route.get("target_umo") == FakeEvent.unified_msg_origin]
     check("bind creates daily-only route", bool(results) and command_routes[-1]["alerts"] is False and command_routes[-1]["report_time"] == "09:00")
+
+    # Real AstrBotConfig-backed bindings are persisted into the Dashboard-visible
+    # template_list, and unbind removes only command-managed entries.
+    dashboard_config = m.AstrBotConfig({
+        "notification_routes": [
+            {
+                "__template_key": "route",
+                "name": "手动路由",
+                "target_umo": FakeEvent.unified_msg_origin,
+                "node": "manual-node",
+                "alerts": True,
+                "report_time": "",
+                "enabled": True,
+                "source": "config",
+            }
+        ]
+    })
+    dashboard_plugin = m.KomariGuardPlugin(FakeContext(), dashboard_config)
+    dashboard_plugin._start_monitor = lambda: None
+    bind_result = await collect(dashboard_plugin.cmd_bind(FakeEvent(), "node1", "09:00", "daily"))
+    saved_routes = dashboard_config["notification_routes"]
+    command_saved = [route for route in saved_routes if route.get("source") == "command"]
+    check(
+        "bind persists dashboard route",
+        bool(bind_result)
+        and dashboard_config.save_calls == 1
+        and len(command_saved) == 1
+        and command_saved[0].get("__template_key") == "route"
+        and command_saved[0].get("report_time") == "09:00",
+    )
+    await collect(dashboard_plugin.cmd_unbind(FakeEvent(), "node1"))
+    remaining_routes = dashboard_config["notification_routes"]
+    check(
+        "unbind preserves manual route",
+        dashboard_config.save_calls == 2
+        and len(remaining_routes) == 1
+        and remaining_routes[0].get("name") == "手动路由",
+    )
+
+    # Existing v2.0.0 state routes migrate once and are removed from state only
+    # after the AstrBot config save succeeds.
+    migration_config = m.AstrBotConfig({"notification_routes": []})
+    migration_plugin = m.KomariGuardPlugin(FakeContext(), migration_config)
+    migration_plugin.state["routes"] = [{
+        "name": "旧命令绑定",
+        "target_umo": target_node,
+        "node": "node1",
+        "alerts": True,
+        "report_time": "",
+        "enabled": True,
+    }]
+    await migration_plugin._migrate_state_routes_to_config()
+    check(
+        "legacy route migrates to dashboard",
+        migration_config.save_calls == 1
+        and migration_plugin.state["routes"] == []
+        and migration_config["notification_routes"][0].get("source") == "command",
+    )
+
+    class FailingAstrBotConfig(m.AstrBotConfig):
+        async def save_config_async(self):
+            raise OSError("simulated write failure")
+
+    class SilentLogger:
+        @staticmethod
+        def exception(*_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def warning(*_args, **_kwargs):
+            pass
+
+    failure_config = FailingAstrBotConfig({"notification_routes": []})
+    failure_plugin = m.KomariGuardPlugin(FakeContext(), failure_config)
+    failure_plugin.logger = SilentLogger()
+    failure_plugin.state["routes"] = [{
+        "target_umo": target_node,
+        "node": "node1",
+        "alerts": True,
+        "report_time": "",
+    }]
+    await failure_plugin._migrate_state_routes_to_config()
+    check(
+        "failed migration retains legacy route",
+        len(failure_plugin.state["routes"]) == 1
+        and failure_config["notification_routes"] == [],
+    )
     for name, method in inspect.getmembers(m.KomariGuardPlugin, inspect.isfunction):
         if name.startswith("cmd_"):
             check(f"fixed command signature {name}", all(param.kind is not inspect.Parameter.VAR_POSITIONAL for param in inspect.signature(method).parameters.values()))

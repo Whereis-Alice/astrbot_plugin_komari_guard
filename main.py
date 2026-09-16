@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import html
 import json
@@ -21,7 +22,7 @@ from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star, StarTools
 
 PLUGIN_ID = "astrbot_plugin_komari_guard"
-PLUGIN_VERSION = "2.0.0"
+PLUGIN_VERSION = "2.0.1"
 REPOSITORY_URL = "https://github.com/Whereis-Alice/astrbot_plugin_komari_guard"
 
 _MSG_TYPES = aiohttp.WSMsgType
@@ -153,9 +154,12 @@ class KomariGuardPlugin(Star):
 
     def __init__(self, context: Context, config: AstrBotConfig | KomariGuardConfig | None = None):
         super().__init__(context)
+        self._astrbot_config: AstrBotConfig | None = None
         if isinstance(config, KomariGuardConfig):
             self.config = config
         else:
+            if isinstance(config, AstrBotConfig):
+                self._astrbot_config = config
             try:
                 raw_config = dict(config or {})
             except (TypeError, ValueError):
@@ -175,6 +179,7 @@ class KomariGuardPlugin(Star):
         self._check_lock = asyncio.Lock()
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
+        self._route_config_lock = asyncio.Lock()
         self._monitor_task: Optional[asyncio.Task] = None
         self._failure_count = 0
         self._filter_warned = False
@@ -222,6 +227,101 @@ class KomariGuardPlugin(Star):
         except OSError as exc:
             self.logger.warning("保存监控状态失败: %s", exc)
 
+    def _route_payload(self, raw: dict[str, Any] | NotificationRoute, *, source: str | None = None) -> dict[str, Any]:
+        if isinstance(raw, NotificationRoute):
+            payload = raw.model_dump()
+        elif isinstance(raw, dict):
+            payload = copy.deepcopy(raw)
+        else:
+            raise TypeError("通知路由必须是对象")
+        payload["__template_key"] = "route"
+        payload["node"] = self._normalize_selector(payload.get("node"))
+        route_source = source or str(payload.get("source") or "config")
+        payload["source"] = route_source if route_source in ("config", "command") else "config"
+        return payload
+
+    def _config_route_payloads(self) -> list[dict[str, Any]]:
+        if self._astrbot_config is None:
+            return []
+        raw_routes = self._astrbot_config.get("notification_routes", [])
+        if not isinstance(raw_routes, list):
+            raise TypeError("notification_routes 配置不是列表")
+        return [self._route_payload(raw) for raw in raw_routes]
+
+    def _sync_runtime_routes(self, payloads: list[dict[str, Any]]) -> None:
+        self.config.notification_routes = [NotificationRoute.model_validate(payload) for payload in payloads]
+
+    async def _persist_config_routes(self, payloads: list[dict[str, Any]]) -> Optional[str]:
+        """Persist Dashboard-visible routes while keeping the in-memory model in sync."""
+        if self._astrbot_config is None:
+            return "AstrBot 未向插件提供可保存的配置对象。"
+        normalized = [self._route_payload(payload) for payload in payloads]
+        previous_raw = copy.deepcopy(self._astrbot_config.get("notification_routes", []))
+        previous_runtime = list(self.config.notification_routes)
+        try:
+            self._astrbot_config["notification_routes"] = normalized
+            self._sync_runtime_routes(normalized)
+            save_async = getattr(self._astrbot_config, "save_config_async", None)
+            if callable(save_async):
+                await save_async()
+            else:
+                save_sync = getattr(self._astrbot_config, "save_config", None)
+                if not callable(save_sync):
+                    raise RuntimeError("当前 AstrBot 配置对象不支持 save_config")
+                await asyncio.to_thread(save_sync)
+            return None
+        except Exception as exc:
+            self._astrbot_config["notification_routes"] = previous_raw
+            self.config.notification_routes = previous_runtime
+            self.logger.exception("保存通知路由配置失败")
+            return f"保存 AstrBot 插件配置失败：{exc}"
+
+    async def _migrate_state_routes_to_config(self) -> None:
+        """Move routes created by v2.0.0 commands into the Dashboard configuration."""
+        if self._astrbot_config is None:
+            return
+        legacy_routes = self.state.get("routes")
+        if not isinstance(legacy_routes, list) or not legacy_routes:
+            return
+        async with self._route_config_lock:
+            try:
+                configured = self._config_route_payloads()
+                known = {
+                    (
+                        route.target_umo,
+                        self._normalize_selector(route.node).casefold(),
+                        route.alerts,
+                        route.report_time,
+                    )
+                    for route in (NotificationRoute.model_validate(raw) for raw in configured)
+                }
+                migrated = 0
+                for raw in legacy_routes:
+                    if not isinstance(raw, dict):
+                        continue
+                    route = NotificationRoute.model_validate({**raw, "source": "command"})
+                    identity = (
+                        route.target_umo,
+                        self._normalize_selector(route.node).casefold(),
+                        route.alerts,
+                        route.report_time,
+                    )
+                    if identity in known:
+                        continue
+                    configured.append(self._route_payload(route, source="command"))
+                    known.add(identity)
+                    migrated += 1
+            except (TypeError, ValueError) as exc:
+                self.logger.warning("旧命令路由迁移失败，继续从状态文件使用：%s", exc)
+                return
+            error = await self._persist_config_routes(configured)
+            if error:
+                self.logger.warning("旧命令路由迁移失败，继续从状态文件使用：%s", error)
+                return
+            self.state["routes"] = []
+            self._save_state()
+            self.logger.info("已将 %s 条命令路由迁移到 notification_routes 配置。", migrated)
+
     @staticmethod
     def _valid_umo(value: str) -> bool:
         parts = value.split(":", 2)
@@ -249,7 +349,8 @@ class KomariGuardPlugin(Star):
     def _routes(self) -> list[NotificationRoute]:
         routes: list[NotificationRoute] = []
         for configured in self.config.notification_routes:
-            route = configured.model_copy(update={"source": "config"})
+            source = configured.source if configured.source in ("config", "command") else "config"
+            route = configured.model_copy(update={"source": source})
             if route.enabled:
                 routes.append(route)
         for index, raw in enumerate(self.state.get("routes", [])):
@@ -1197,6 +1298,7 @@ class KomariGuardPlugin(Star):
 
     async def initialize(self) -> None:
         """Start background monitoring after AstrBot finishes plugin setup."""
+        await self._migrate_state_routes_to_config()
         self._start_monitor()
 
     def _start_monitor(self) -> None:
@@ -1507,27 +1609,55 @@ class KomariGuardPlugin(Star):
         if route_mode == "alert":
             time_spec = ""
 
-        raw_routes = self.state.setdefault("routes", [])
-        raw_routes[:] = [
-            route for route in raw_routes
-            if not (isinstance(route, dict)
-                    and route.get("target_umo") == target
-                    and self._normalize_selector(route.get("node")).casefold() == selector.casefold())
-        ]
-        raw_routes.append({
+        route_payload = {
+            "__template_key": "route",
             "name": "命令绑定",
             "target_umo": target,
             "node": selector,
             "alerts": route_mode in ("alert", "both"),
             "report_time": time_spec,
             "enabled": True,
-        })
-        self._save_state()
+            "source": "command",
+        }
+        persist_error: Optional[str] = None
+        async with self._route_config_lock:
+            if self._astrbot_config is not None:
+                try:
+                    configured = self._config_route_payloads()
+                    configured = [
+                        raw for raw in configured
+                        if not (
+                            NotificationRoute.model_validate(raw).source == "command"
+                            and str(raw.get("target_umo") or "") == target
+                            and self._normalize_selector(raw.get("node")).casefold() == selector.casefold()
+                        )
+                    ]
+                    configured.append(route_payload)
+                    persist_error = await self._persist_config_routes(configured)
+                except (TypeError, ValueError) as exc:
+                    persist_error = f"notification_routes 配置无效：{exc}"
+            else:
+                # Unit tests and older non-standard loaders may not provide an
+                # AstrBotConfig. Keep the legacy isolated-state fallback usable.
+                raw_routes = self.state.setdefault("routes", [])
+                raw_routes[:] = [
+                    route for route in raw_routes
+                    if not (isinstance(route, dict)
+                            and route.get("target_umo") == target
+                            and self._normalize_selector(route.get("node")).casefold() == selector.casefold())
+                ]
+                raw_routes.append(route_payload)
+                self._save_state()
+        if persist_error:
+            yield event.plain_result(f"❌ 绑定失败：{persist_error}")
+            return
         self._start_monitor()
         schedule = time_spec or ((self.config.status_report_time or "").strip() if route_mode != "alert" else "")
         summary = ["✅ 已绑定当前会话", f"节点：{selector}", f"模式：{route_mode}"]
         if schedule:
             summary.append(f"日报：{schedule}（AstrBot 宿主本地时间）")
+        if self._astrbot_config is not None:
+            summary.append("配置：已写入 notification_routes（刷新配置页可见）")
         yield event.plain_result("\n".join(summary))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1536,15 +1666,44 @@ class KomariGuardPlugin(Star):
         """删除当前会话由命令创建的路由。"""
         target = str(event.unified_msg_origin)
         selector = self._normalize_selector(node) if isinstance(node, str) and node.strip() else ""
-        raw_routes = self.state.setdefault("routes", [])
-        before = len(raw_routes)
-        raw_routes[:] = [
-            route for route in raw_routes
-            if not (isinstance(route, dict)
-                    and route.get("target_umo") == target
-                    and (not selector or self._normalize_selector(route.get("node")).casefold() == selector.casefold()))
-        ]
-        removed = before - len(raw_routes)
+        removed = 0
+        persist_error: Optional[str] = None
+        async with self._route_config_lock:
+            if self._astrbot_config is not None:
+                try:
+                    configured = self._config_route_payloads()
+                    kept: list[dict[str, Any]] = []
+                    for raw in configured:
+                        route = NotificationRoute.model_validate(raw)
+                        matches = (
+                            route.source == "command"
+                            and route.target_umo == target
+                            and (not selector or self._normalize_selector(route.node).casefold() == selector.casefold())
+                        )
+                        if matches:
+                            removed += 1
+                        else:
+                            kept.append(raw)
+                    if removed:
+                        persist_error = await self._persist_config_routes(kept)
+                        if persist_error:
+                            removed = 0
+                except (TypeError, ValueError) as exc:
+                    persist_error = f"notification_routes 配置无效：{exc}"
+
+            if not persist_error:
+                raw_routes = self.state.setdefault("routes", [])
+                before = len(raw_routes)
+                raw_routes[:] = [
+                    route for route in raw_routes
+                    if not (isinstance(route, dict)
+                            and route.get("target_umo") == target
+                            and (not selector or self._normalize_selector(route.get("node")).casefold() == selector.casefold()))
+                ]
+                removed += before - len(raw_routes)
+        if persist_error:
+            yield event.plain_result(f"❌ 解绑失败：{persist_error}")
+            return
         if target not in self._targets():
             self.state.setdefault("pending_alerts", {}).pop(target, None)
             self.state.setdefault("muted", {}).pop(target, None)
@@ -1552,7 +1711,7 @@ class KomariGuardPlugin(Star):
         if removed:
             yield event.plain_result(f"✅ 已删除 {removed} 条当前会话的命令路由。")
         else:
-            yield event.plain_result("未找到匹配的命令路由；配置页创建的路由需在配置页删除。")
+            yield event.plain_result("未找到匹配的命令路由；手动创建的配置路由需在配置页删除。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @kg.command("r", alias={"routes", "路由"})

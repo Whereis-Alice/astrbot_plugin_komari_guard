@@ -72,6 +72,8 @@ Komari Guard 是一个面向 [AstrBot](https://github.com/AstrBotDevs/AstrBot) �
 
 模式支持 `alert`、`daily`、`both`。未写模式时，有时刻就默认 `both`，无时刻就默认 `alert`。
 
+绑定成功后，插件会立即把路由保存到 AstrBot 插件配置的 `notification_routes`。刷新 Dashboard 配置页即可看到并编辑该条目；插件升级前已经由 `/kg b` 创建的状态文件路由也会在首次启动时自动迁移。`/kg ub` 只删除由命令创建的路由，不会误删手动添加的配置路由。
+
 ### 节点选择规则
 
 - `*`：全部节点。
@@ -89,7 +91,7 @@ Komari Guard 是一个面向 [AstrBot](https://github.com/AstrBotDevs/AstrBot) �
 <平台实例 ID>:GroupMessage|FriendMessage|OtherMessage:<会话 ID>
 ```
 
-它不是单独的群号或 QQ 号。最稳妥的获取方式是先到目标会话执行 `/kg b`，再用 `/kg r` 查看 AstrBot 原样生成的 UMO。配置页路由和命令路由会同时生效；`/kg ub` 只删除命令路由。
+它不是单独的群号或 QQ 号。最稳妥的获取方式是先到目标会话执行 `/kg b`，再刷新配置页或用 `/kg r` 查看 AstrBot 原样生成的 UMO。配置页手动创建和命令创建的路由会同时生效。
 
 ### 日报时间
 

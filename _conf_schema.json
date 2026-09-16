@@ -40,7 +40,8 @@
             "hint": "AstrBot 宿主本地时间 HH:MM，如 09:00；留空时使用全局日报设置",
             "default": ""
           },
-          "enabled": {"type": "bool", "description": "启用路由", "default": true}
+          "enabled": {"type": "bool", "description": "启用路由", "default": true},
+          "source": {"type": "string", "default": "config", "invisible": true}
         }
       }
     }
