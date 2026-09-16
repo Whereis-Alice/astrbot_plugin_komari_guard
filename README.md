@@ -1,44 +1,169 @@
-# Komari 监控推送插件
+<p align="center">
+  <img src="./logo.png" width="160" alt="Komari Guard Logo">
+</p>
 
-英文名称：**Komari Watch**（插件标识：`astrbot_plugin_komari_watch`）  
-创建者：xiaowan
+# Komari Guard
 
-这是一个独立实现的 AstrBot 插件，借鉴了社区 `astrbot_plugin_komari_status` 的查询思路，但没有复用其代码。除节点查询外，本插件增加了适合长期运行的离线确认、高负载确认、告警冷却和恢复通知。
+Komari Guard 是一个面向 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的 Komari 节点监控插件。它可查询节点状态和历史趋势，也可将离线、高负载、恢复、重启等通知按节点分发到指定私聊或群聊。
 
-## 功能
+本项目使用独立的插件 ID `astrbot_plugin_komari_guard`、数据目录和 `/kg` 命令组，可与 `astrbot_plugin_komari_watch` 同时安装，不会冲突。
 
-- `/komari_status`（别名 `/kstatus`、`/komari`）：生成状态图片，展示节点在线状态、CPU、内存、磁盘、网络速率、负载与运行时间；可加节点名只看指定节点，如 `/komari_status node01`。卡片头部附"共/在线/离线"统计。
-- `/komari_realtime`、`/komari_public`、`/komari_version`：查询实时数据（不经历史兜底）、公开站点信息和服务端版本。
-- `/komari_history`（别名 `/khistory`、`/历史`）：查询历史资源趋势曲线（CPU / 内存 / 磁盘 / 上下行流量，均标注当前值与峰值），如 `/komari_history 6 nodeA`（小时数 1-24，可加节点名过滤）。
-- `/komari_nodes`（别名 `/knodes`）：列出全部节点名称及过滤排除情况，便于填写 `filter_nodes` 与查询参数。
-- `/komari_top [指标] [数量]`（别名 `/ktop`）：资源占用 Top 榜，如 `/komari_top mem 10`（指标 cpu/mem/disk，默认 cpu 前 5，仅统计在线节点）。
-- `/komari_alerts`（别名 `/kalerts`）：查看最近的一批告警记录。
-- `/komari_mute <分钟> [all]`：临时静默告警（默认 30 分钟；默认只静默当前会话，加 `all` 静默全部绑定会话）；`/komari_unmute [all]` 提前恢复。
-- `/komari_help`（别名 `/khelp`）：全部命令总览。
-- `/komari_bind`：把当前 OneBot 私聊或群聊绑定为告警接收目标。
-- `/komari_unbind`：解除当前会话绑定。
-- `/komari_check`：立即执行一次检查。
-- 后台轮询 `/api/nodes`，优先从 `/api/clients` WebSocket 读取实时指标；WebSocket 被反代禁用时自动使用最近一条负载记录兜底。
-- 节点连续多个周期无心跳才告警；高负载连续多个周期超过阈值才告警；同类告警支持冷却和恢复通知。
-- 同一周期内多个节点离线/恢复会合并成一条告警；Komari 整体不可达时检查会自动指数退避，降低无效重试与日志噪音。
-- 面板连续多次检查失败会推送"不可达"告警，恢复时自动通知；节点重启（运行时间回退）会推送提醒；节点长期离线可配置每日提醒。
+## 主要能力
 
-## 安装配置
+- 查询全部或单个节点的在线状态、CPU、内存、磁盘、网络、负载与运行时长。
+- 查询 1-24 小时的资源与流量趋势，以及在线节点资源排行。
+- 监控节点离线、CPU/内存/磁盘超阈值、恢复、重启、长期离线和 Komari 面板不可达。
+- 通知路由可分别指定目标会话、节点、是否接收告警、每日日报时刻。
+- 同一目标的重叠路由会自动去重；发送失败或静默期间的告警进入持久待发队列。
+- WebSocket 不可用时自动使用历史记录；两条遥测通道都失败时标记为“未知”，不会批量误报离线。
 
-在 AstrBot 插件配置页面填写 Komari 地址，私有站点再填写 Token。按需调整轮询间隔、离线确认周期、CPU/内存/磁盘阈值等。启动后在目标 OneBot 群里发送 `/komari_bind` 即可接收推送；绑定信息保存于 AstrBot 的 `data/plugin_data/astrbot_plugin_komari_watch/state.json`。
+## 兼容性
 
-支持的可选配置：
-- `filter_mode` / `filter_nodes`：节点过滤。`filter_mode` 为 `none`（默认，不过滤）、`allow`（只监控列表中节点）或 `deny`（排除列表中节点）；`filter_nodes` 填写节点名，多个用英文逗号分隔，支持子串匹配（匹配名称、主机名、id、uuid）。
-- `status_report_interval`：定时状态推送间隔（小时），大于 0 时后台监控会按该间隔向绑定会话推送状态卡片，0 表示关闭。
-- `status_report_time`：每天固定时刻（本地时间 `HH:MM`，如 `09:00`）推送状态卡片，留空不启用；可与间隔推送共存，先到先推。
-- `prune_missing_cycles`：节点从服务器消失多少周期后清理其监控状态，防止 `state.json` 无限增长。
-- `panel_fail_cycles`：面板连续多少次检查失败后推送"面板不可达"告警（恢复时自动通知），0 表示关闭。
-- `notify_restart`：检测到节点运行时间回退（重启）时推送通知。
-- `long_offline_remind_hours`：节点离线超过该小时数后每日提醒一次，0 表示关闭。
-- `notify_recovery`：关闭后不再推送恢复通知（其余保持不变）。
+- AstrBot `>=4.16,<5`
+- Python `>=3.10`
+- Komari 1.4/1.5 常见 API 结构
+- 声明支持 `aiocqhttp`；其他平台必须支持 AstrBot 主动消息
 
-建议先用 `/komari_check` 验证 API 与权限，再开启较短的轮询周期。Token 只保存在 AstrBot 配置中，不会写入日志。
+## 快速开始
 
-## 开源说明
+1. 在 AstrBot 插件管理页安装本仓库。
+2. 填写 `komari_url`；私有 Komari 站点再填写 `komari_token`。
+3. 在目标私聊或群聊中发送 `/kg ck` 验证连接。
+4. 发送 `/kg b` 绑定当前会话的全部节点告警。
+5. 发送 `/kg r` 检查已生效的路由。
 
-本项目遵循 MIT License，欢迎提交 Issue 和 Pull Request。仓库地址：<https://github.com/xiaowan138/astrbot_plugin_komari_watch>
+`/kg h` 可随时查看命令速查。除帮助外，命令默认需要 AstrBot 管理员权限，防止群成员查看隐藏节点或修改推送配置。如需对成员开放查询，可在 AstrBot Dashboard 中单独调整命令权限。
+
+## 命令
+
+| 命令 | 作用 | 示例 |
+| --- | --- | --- |
+| `/kg s [节点]` | 状态报告 | `/kg s web-01` |
+| `/kg rt [节点]` | WebSocket 实时状态 | `/kg rt` |
+| `/kg his [小时] [节点]` | 历史趋势 | `/kg his 6 web-01` |
+| `/kg ls` | 节点列表 | `/kg ls` |
+| `/kg top [cpu\|mem\|disk] [数量]` | 在线节点排行 | `/kg top mem 10` |
+| `/kg b [节点] [HH:MM] [模式]` | 绑定当前会话 | `/kg b web-01 09:00 both` |
+| `/kg ub [节点]` | 删除当前会话的命令路由 | `/kg ub web-01` |
+| `/kg r` | 列出所有路由 | `/kg r` |
+| `/kg m [分钟] [all]` | 暂停当前或所有目标 | `/kg m 60` |
+| `/kg um [all]` | 解除暂停并补发待发告警 | `/kg um` |
+| `/kg a` | 最近 10 条告警（`alert` 也可用） | `/kg a` |
+| `/kg ck` | 立即检查一次 | `/kg ck` |
+| `/kg i` / `/kg v` | 站点信息 / Komari 版本（`info` / `ver` 也可用） | `/kg v` |
+
+## 通知路由
+
+路由是本插件的核心：
+
+```text
+目标 UMO + 节点选择 + 告警开关 + 日报时刻
+```
+
+### 在当前会话快速绑定
+
+```text
+/kg b                         # 全部节点告警
+/kg b web-01                  # 仅 web-01 告警
+/kg b web-01 09:00            # web-01 告警 + 每日 09:00 日报
+/kg b web-01 09:00 daily      # 仅每日 09:00 日报
+/kg b web-01 09:00 both       # 告警 + 每日 09:00 日报
+```
+
+模式支持 `alert`、`daily`、`both`。未写模式时，有时刻就默认 `both`，无时刻就默认 `alert`。
+
+### 节点选择规则
+
+- `*`：全部节点。
+- `web-01`：精确匹配节点名、主机名、ID 或 UUID，避免误匹配 `web-010`。
+- `node-a,node-b`：一条路由选择多个节点。
+- `~web`：显式使用子串匹配。
+
+节点可改名时，建议在配置页使用 UUID。
+
+### 发往指定私聊或群聊
+
+在 `_conf_schema.json` 对应的“通知路由”配置中添加路由，并填入完整 `target_umo`。UMO 的实际格式是：
+
+```text
+<平台实例 ID>:GroupMessage|FriendMessage|OtherMessage:<会话 ID>
+```
+
+它不是单独的群号或 QQ 号。最稳妥的获取方式是先到目标会话执行 `/kg b`，再用 `/kg r` 查看 AstrBot 原样生成的 UMO。配置页路由和命令路由会同时生效；`/kg ub` 只删除命令路由。
+
+### 日报时间
+
+- `report_time` 使用 AstrBot 宿主的本地时间，格式为 `HH:MM`。
+- 每条路由单独记录上次发送，不会互相抑制。
+- 日报在轮询时触发，最多会比设定时刻晚一个 `poll_interval`。
+- 路由没写 `report_time` 时，使用全局 `status_report_time` 或 `status_report_interval`。
+
+## 主要配置
+
+| 配置 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `notification_routes` | `[]` | 指定目标 UMO、节点、告警和日报 |
+| `poll_interval` | `60` | 轮询秒数 |
+| `offline_grace_cycles` | `2` | 离线连续确认次数 |
+| `cpu_threshold` | `90` | CPU 告警阈值（%） |
+| `memory_threshold` | `90` | 内存告警阈值（%） |
+| `disk_threshold` | `90` | 磁盘告警阈值（%） |
+| `high_load_cycles` | `2` | 高负载连续确认次数 |
+| `alert_cooldown` | `1800` | 同类告警冷却秒数 |
+| `filter_mode` | `none` | `none` / `allow` / `deny` 全局节点过滤 |
+| `status_report_time` | 空 | 全局每日日报默认时刻 |
+| `status_report_interval` | `0` | 全局日报间隔（小时），`0` 关闭 |
+| `panel_fail_cycles` | `3` | 面板连续失败告警，`0` 关闭 |
+| `long_offline_remind_hours` | `0` | 长期离线每日提醒，`0` 关闭 |
+| `image_output` | `false` | 使用 HTML 渲染的图片卡片 |
+
+完整配置和提示可直接在 AstrBot Dashboard 的插件配置页查看。运行时还会用 Pydantic 再次校验数值边界，避免错误配置进入监控循环。
+
+## 告警与可靠性
+
+- Komari 的 CPU 字段按 `0..100` 百分数处理；`0.8` 表示 `0.8%`，不会被放大为 `80%`。
+- 支持 Komari 1.4 的扁平 WS 字段和 1.5 的嵌套字段。
+- 指标缺失不会触发“负载恢复”；必须重新观测到之前超标的指标已回落。
+- 静默是“暂停发送”，不是丢弃事件。待发告警在解除静默或平台恢复后补发，每个目标最多保留 50 条去重消息。
+- 状态以原子替换方式写入新插件专用数据目录。
+- 监控循环有异常边界和指数退避，单次未预期异常不会让后台监控永久停止。
+
+## 隐私与安全
+
+- `komari_token` 只用于请求 Komari，不会写入插件日志或状态文件。
+- `image_output` 默认关闭。启用后，AstrBot `html_render` 可能通过你配置的 T2I 服务渲染卡片，节点名和指标会出现在渲染内容中。对外部服务有隐私顾虑时请保持关闭。
+- 路由 UMO 应从 AstrBot 原样复用，不要把不可信用户输入直接写入配置。
+
+## 常见问题
+
+### `/kg rt` 提示 WebSocket 不可用
+
+反向代理可能没有转发 WebSocket，或拦截了 `Origin`。插件会自动使用 `/api/records/load` 作为后台监控的历史兜底；手动查询可用 `/kg s`。
+
+### 绑定成功但收不到消息
+
+1. 用 `/kg r` 确认路由中的 UMO 完整。
+2. 确认平台适配器支持主动消息。
+3. 检查 `/kg m` 静默是否仍生效。
+4. 查看 AstrBot 日志中的“未找到平台实例”或适配器发送错误。
+
+### 节点显示“未知”
+
+这表示插件能读取节点列表，但本轮 WebSocket 和该节点历史遥测都不可用。“未知”不会累计离线周期，避免数据源故障变成节点离线误报。
+
+## 开发与验证
+
+```bash
+python -m pip install -r requirements.txt
+python test_smoke.py
+```
+
+回归套件覆盖指标解析、遥测三态、路由隔离与去重、待发重试、静默补发、独立日报进度、命令签名和 AstrBot `chain_result` 契约。
+
+## 来源与致谢
+
+本项目基于 [xiaowan138/astrbot_plugin_komari_watch](https://github.com/xiaowan138/astrbot_plugin_komari_watch) 的 MIT 许可代码衍生，保留原项目提交历史和许可声明。本版合入并扩展了上游 [PR #1](https://github.com/xiaowan138/astrbot_plugin_komari_watch/pull/1)、[Issue #2](https://github.com/xiaowan138/astrbot_plugin_komari_watch/issues/2) 和 [Issue #3](https://github.com/xiaowan138/astrbot_plugin_komari_watch/issues/3) 中报告的问题。
+
+## 许可证
+
+[MIT License](./LICENSE)

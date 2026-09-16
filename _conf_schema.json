@@ -1,23 +1,158 @@
 {
-  "komari_url": {"type": "string", "description": "Komari 服务器地址", "hint": "例如 https://status.example.com", "default": ""},
-  "komari_token": {"type": "string", "description": "API Token", "hint": "私有站点填写 API Key 或 Session Token", "default": ""},
-  "image_output": {"type": "bool", "description": "状态以图片发送", "hint": "关闭后使用兼容性更好的纯文本消息", "default": true},
-  "image_width": {"type": "int", "description": "状态图片宽度", "hint": "推荐 800 到 1000 像素", "default": 900, "minimum": 500, "maximum": 1600},
-  "poll_interval": {"type": "int", "description": "轮询间隔（秒）", "hint": "建议 60 秒以上", "default": 60, "minimum": 15, "maximum": 3600},
-  "offline_grace_cycles": {"type": "int", "description": "离线确认周期", "hint": "连续无心跳多少次才推送离线告警", "default": 2, "minimum": 1, "maximum": 10},
-  "cpu_threshold": {"type": "float", "description": "CPU 告警阈值（%）", "default": 90, "minimum": 1, "maximum": 100},
-  "memory_threshold": {"type": "float", "description": "内存告警阈值（%）", "default": 90, "minimum": 1, "maximum": 100},
-  "disk_threshold": {"type": "float", "description": "磁盘告警阈值（%）", "default": 90, "minimum": 1, "maximum": 100},
-  "high_load_cycles": {"type": "int", "description": "高负载确认周期", "hint": "连续超阈值多少次才推送", "default": 2, "minimum": 1, "maximum": 10},
-  "alert_cooldown": {"type": "int", "description": "告警冷却时间（秒）", "default": 1800, "minimum": 0, "maximum": 86400},
+  "komari_url": {
+    "type": "string",
+    "description": "Komari 服务器地址",
+    "hint": "例如 https://status.example.com，不要填末尾的 /",
+    "default": ""
+  },
+  "komari_token": {
+    "type": "string",
+    "description": "API Token 或 Session Token",
+    "hint": "公开站点可留空；插件不会把 Token 写入日志",
+    "default": ""
+  },
+  "notification_routes": {
+    "type": "template_list",
+    "description": "通知路由",
+    "hint": "每条路由可将全部或指定节点的告警/日报发往一个 UMO；也可用 /kg b 绑定当前会话",
+    "default": [],
+    "templates": {
+      "route": {
+        "name": "推送路由",
+        "items": {
+          "name": {"type": "string", "description": "路由名称", "default": "默认路由"},
+          "target_umo": {
+            "type": "string",
+            "description": "目标 UMO",
+            "hint": "必须是 AstrBot 完整会话标识，例如 platform-instance:GroupMessage:123456；不能只填群号",
+            "default": ""
+          },
+          "node": {
+            "type": "string",
+            "description": "节点选择",
+            "hint": "* 表示全部；可填精确的节点名、主机名、ID 或 UUID；多个用英文逗号；~web 表示子串匹配",
+            "default": "*"
+          },
+          "alerts": {"type": "bool", "description": "接收告警", "default": true},
+          "report_time": {
+            "type": "string",
+            "description": "每日日报时刻",
+            "hint": "AstrBot 宿主本地时间 HH:MM，如 09:00；留空时使用全局日报设置",
+            "default": ""
+          },
+          "enabled": {"type": "bool", "description": "启用路由", "default": true}
+        }
+      }
+    }
+  },
+  "image_output": {
+    "type": "bool",
+    "description": "状态和日报使用图片卡片",
+    "hint": "默认关闭。启用后 AstrBot html_render 可能把节点名和指标发给你配置的 T2I 渲染服务",
+    "obvious_hint": true,
+    "default": false
+  },
+  "image_width": {
+    "type": "int",
+    "description": "状态图片宽度",
+    "default": 900,
+    "slider": {"min": 500, "max": 1600, "step": 50}
+  },
+  "poll_interval": {
+    "type": "int",
+    "description": "轮询间隔（秒）",
+    "hint": "建议 60 秒或更长",
+    "default": 60,
+    "slider": {"min": 15, "max": 3600, "step": 15}
+  },
+  "offline_grace_cycles": {
+    "type": "int",
+    "description": "离线确认周期",
+    "hint": "连续无心跳多少次后才告警",
+    "default": 2,
+    "slider": {"min": 1, "max": 10, "step": 1}
+  },
+  "cpu_threshold": {
+    "type": "float",
+    "description": "CPU 告警阈值（%）",
+    "default": 90,
+    "slider": {"min": 1, "max": 100, "step": 1}
+  },
+  "memory_threshold": {
+    "type": "float",
+    "description": "内存告警阈值（%）",
+    "default": 90,
+    "slider": {"min": 1, "max": 100, "step": 1}
+  },
+  "disk_threshold": {
+    "type": "float",
+    "description": "磁盘告警阈值（%）",
+    "default": 90,
+    "slider": {"min": 1, "max": 100, "step": 1}
+  },
+  "high_load_cycles": {
+    "type": "int",
+    "description": "高负载确认周期",
+    "default": 2,
+    "slider": {"min": 1, "max": 10, "step": 1}
+  },
+  "alert_cooldown": {
+    "type": "int",
+    "description": "同类告警冷却时间（秒）",
+    "default": 1800,
+    "slider": {"min": 0, "max": 86400, "step": 60}
+  },
   "notify_recovery": {"type": "bool", "description": "推送恢复通知", "default": true},
-  "request_timeout": {"type": "int", "description": "请求超时（秒）", "default": 10, "minimum": 3, "maximum": 60},
-  "filter_mode": {"type": "string", "description": "节点过滤模式", "hint": "none=不过滤；allow=只监控列表中节点；deny=排除列表中节点", "default": "none"},
-  "filter_nodes": {"type": "string", "description": "过滤/白名单节点", "hint": "节点名，多个用英文逗号分隔，支持子串匹配", "default": ""},
-  "status_report_interval": {"type": "int", "description": "定时状态推送间隔（小时）", "hint": "大于 0 时按该间隔向绑定会话推送状态卡片，0 表示关闭", "default": 0, "minimum": 0, "maximum": 720},
-  "status_report_time": {"type": "string", "description": "每天定时推送时刻", "hint": "本地时间 HH:MM（如 09:00），到点自动推送状态卡片，留空不启用", "default": ""},
-  "prune_missing_cycles": {"type": "int", "description": "节点清理周期", "hint": "节点从服务器消失多少周期后清理其监控状态", "default": 5, "minimum": 1, "maximum": 100},
-  "panel_fail_cycles": {"type": "int", "description": "面板故障告警周期", "hint": "连续多少次检查失败后推送面板不可达告警，恢复时自动通知，0 表示关闭", "default": 3, "minimum": 0, "maximum": 10},
-  "notify_restart": {"type": "bool", "description": "推送节点重启通知", "hint": "检测到运行时间回退时推送提醒", "default": true},
-  "long_offline_remind_hours": {"type": "int", "description": "长期离线提醒（小时）", "hint": "节点离线超过该时长后每日提醒一次，0 表示关闭", "default": 0, "minimum": 0, "maximum": 720}
+  "request_timeout": {
+    "type": "int",
+    "description": "HTTP/WebSocket 请求超时（秒）",
+    "default": 10,
+    "slider": {"min": 3, "max": 60, "step": 1}
+  },
+  "filter_mode": {
+    "type": "string",
+    "description": "全局节点过滤模式",
+    "default": "none",
+    "options": ["none", "allow", "deny"]
+  },
+  "filter_nodes": {
+    "type": "string",
+    "description": "全局过滤节点",
+    "hint": "多个名称用英文逗号分隔；这一层在通知路由之前生效",
+    "default": ""
+  },
+  "status_report_interval": {
+    "type": "int",
+    "description": "全局日报间隔（小时）",
+    "hint": "大于 0 时对每条路由独立计时；0 表示关闭",
+    "default": 0,
+    "slider": {"min": 0, "max": 720, "step": 1}
+  },
+  "status_report_time": {
+    "type": "string",
+    "description": "全局每日日报时刻",
+    "hint": "AstrBot 宿主本地时间 HH:MM；路由自己的 report_time 优先",
+    "default": ""
+  },
+  "prune_missing_cycles": {
+    "type": "int",
+    "description": "节点消失多少周期后清理状态",
+    "default": 5,
+    "slider": {"min": 1, "max": 100, "step": 1}
+  },
+  "panel_fail_cycles": {
+    "type": "int",
+    "description": "面板故障告警周期",
+    "hint": "连续多少次失败后告警；0 表示关闭",
+    "default": 3,
+    "slider": {"min": 0, "max": 10, "step": 1}
+  },
+  "notify_restart": {"type": "bool", "description": "推送节点重启通知", "default": true},
+  "long_offline_remind_hours": {
+    "type": "int",
+    "description": "长期离线提醒（小时）",
+    "hint": "超过该时长后每日提醒一次；0 表示关闭",
+    "default": 0,
+    "slider": {"min": 0, "max": 720, "step": 1}
+  }
 }

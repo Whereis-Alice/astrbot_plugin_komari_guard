@@ -1,11 +1,15 @@
-name: astrbot_plugin_komari_watch
-display_name: Komari 监控推送插件
-author: xiaowan
-version: 1.4.0
+name: astrbot_plugin_komari_guard
+display_name: Komari Guard
 desc: >-
-  面向 AstrBot 的 Komari 监控插件。支持节点状态、实时资源查询，
-  并通过统一消息来源向 OneBot 会话推送服务器离线和 CPU、内存、磁盘超阈值告警。
-short_desc: Komari 节点查询、离线告警与高负载 OneBot 推送。
+  Komari 节点监控与分流通知插件。支持按节点和会话路由离线、高负载、
+  恢复与重启告警，并可为每条路由设置每日定时状态推送。
+version: v2.0.0
+author: Where-is-Alice
+repo: https://github.com/Whereis-Alice/astrbot_plugin_komari_guard
+astrbot_version: ">=4.16,<5"
 support_platforms:
   - aiocqhttp
-  - onebot
+tags:
+  - komari
+  - monitoring
+  - alert

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Komari Guard logo</title>
+  <desc id="desc">A shield containing a server stack and a monitoring pulse.</desc>
+  <path
+    d="M512 64 846 184v270c0 225-128 399-334 506C306 853 178 679 178 454V184L512 64Z"
+    fill="#F7FAF9"
+    stroke="#173B3F"
+    stroke-width="42"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M512 118 794 219v232c0 184-99 331-282 431-183-100-282-247-282-431V219L512 118Z"
+    fill="#0F766E"
+  />
+  <g stroke="#173B3F" stroke-width="24">
+    <rect x="278" y="276" width="468" height="142" rx="30" fill="#FFFFFF" />
+    <rect x="278" y="441" width="468" height="142" rx="30" fill="#FFFFFF" />
+    <rect x="278" y="606" width="468" height="142" rx="30" fill="#FFFFFF" />
+  </g>
+  <g fill="#173B3F">
+    <rect x="352" y="326" width="250" height="38" rx="19" />
+    <rect x="352" y="491" width="250" height="38" rx="19" />
+    <rect x="352" y="656" width="250" height="38" rx="19" />
+  </g>
+  <circle cx="665" cy="345" r="23" fill="#19A974" />
+  <circle cx="665" cy="510" r="23" fill="#F5A623" />
+  <circle cx="665" cy="675" r="23" fill="#19A974" />
+  <path
+    d="M238 520h118l49-82 82 166 71-126 48 42h180"
+    fill="none"
+    stroke="#F25F5C"
+    stroke-width="34"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <circle cx="754" cy="754" r="112" fill="#F25F5C" stroke="#173B3F" stroke-width="28" />
+  <path
+    d="m700 755 38 39 75-88"
+    fill="none"
+    stroke="#FFFFFF"
+    stroke-width="30"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

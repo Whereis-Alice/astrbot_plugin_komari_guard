@@ -1,232 +1,363 @@
-"""Smoke test with mocked astrbot modules.
+"""Offline regression suite for Komari Guard.
 
-Run: python test_smoke.py  (requires pydantic + aiohttp)
-Covers the alert engine end-to-end (offline/high-load/recovery/restart/
-long-offline/panel-failure), HTML rendering and command handlers.
+Run with: python test_smoke.py
+Only runtime dependencies from requirements.txt are needed.
 """
+
+from __future__ import annotations
+
 import asyncio
-import shutil
+import inspect
+import json
+import logging
 import sys
+import tempfile
 import types
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-shutil.rmtree(ROOT / "data", ignore_errors=True)
 
 
-def _mock_astrbot():
+def _mock_astrbot() -> type:
     astrbot = types.ModuleType("astrbot")
     api = types.ModuleType("astrbot.api")
     event_mod = types.ModuleType("astrbot.api.event")
     comp_mod = types.ModuleType("astrbot.api.message_components")
     star_mod = types.ModuleType("astrbot.api.star")
 
+    class AstrBotConfig(dict):
+        pass
+
+    class Plain:
+        def __init__(self, text: str):
+            self.text = text
+
+    class Image:
+        def __init__(self, url: str):
+            self.url = url
+
+        @staticmethod
+        def fromURL(url: str):
+            return Image(url)
+
+    class MessageChain:
+        def __init__(self, chain=None):
+            self.chain = list(chain or [])
+
+        def message(self, text: str):
+            self.chain.append(Plain(text))
+            return self
+
+        def get_plain_text(self):
+            return " ".join(item.text for item in self.chain if isinstance(item, Plain))
+
     class AstrMessageEvent:
         pass
 
-    class MessageChain:
-        def __init__(self, items=None):
-            self.items = list(items or [])
+    class _PermissionType:
+        ADMIN = "admin"
 
-        def message(self, text):
-            self.items.append(text)
-            return self
+    class _Group:
+        def command(self, *_args, **_kwargs):
+            return lambda func: func
 
     class _Filter:
+        PermissionType = _PermissionType
+
         @staticmethod
-        def command(*args, **kwargs):
-            def deco(func):
-                return func
-            return deco
+        def command_group(*_args, **_kwargs):
+            return lambda _func: _Group()
+
+        @staticmethod
+        def permission_type(*_args, **_kwargs):
+            return lambda func: func
 
     class Star:
         def __init__(self, context=None):
             self.context = context
 
+        async def html_render(self, *_args, **_kwargs):
+            return "https://renderer.invalid/card.png"
+
     class Context:
         pass
 
-    class Image:
-        @staticmethod
-        def fromURL(url):
-            return ("image", url)
+    class StarTools:
+        data_dir = ROOT / ".test-data"
 
+        @classmethod
+        def get_data_dir(cls, _plugin_name=None):
+            return Path(cls.data_dir)
+
+    api.AstrBotConfig = AstrBotConfig
+    api.logger = logging.getLogger("komari-guard-test")
     event_mod.AstrMessageEvent = AstrMessageEvent
     event_mod.MessageChain = MessageChain
     event_mod.filter = _Filter()
     comp_mod.Image = Image
     star_mod.Context = Context
     star_mod.Star = Star
-    star_mod.register = lambda *a, **k: (lambda cls: cls)
-
+    star_mod.StarTools = StarTools
     astrbot.api = api
     api.event = event_mod
     api.message_components = comp_mod
     api.star = star_mod
     sys.modules.update({
-        "astrbot": astrbot, "astrbot.api": api,
+        "astrbot": astrbot,
+        "astrbot.api": api,
         "astrbot.api.event": event_mod,
         "astrbot.api.message_components": comp_mod,
         "astrbot.api.star": star_mod,
     })
+    return StarTools
 
 
-_mock_astrbot()
+StarTools = _mock_astrbot()
 sys.path.insert(0, str(ROOT))
 import main as m  # noqa: E402
 
-PASS, FAIL = [], []
-SENT: list[str] = []
+
+PASS: list[str] = []
+FAIL: list[str] = []
 
 
-def check(name, cond):
-    (PASS if cond else FAIL).append(name)
+def check(name: str, condition: bool) -> None:
+    (PASS if condition else FAIL).append(name)
+
+
+class FakeMeta:
+    support_proactive_message = True
+
+
+class FakePlatform:
+    @staticmethod
+    def meta():
+        return FakeMeta()
+
+
+class FakeContext:
+    def __init__(self):
+        self.sent: list[tuple[str, str]] = []
+        self.fail_targets: set[str] = set()
+
+    @staticmethod
+    def get_platform_inst(_platform_id: str):
+        return FakePlatform()
+
+    async def send_message(self, target: str, chain) -> bool:
+        if target in self.fail_targets:
+            return False
+        self.sent.append((target, chain.get_plain_text()))
+        return True
 
 
 class FakeEvent:
-    unified_msg_origin = "test:origin"
+    unified_msg_origin = "test:GroupMessage:room"
 
     @staticmethod
-    def plain_result(text):
+    def get_platform_id() -> str:
+        return "test"
+
+    @staticmethod
+    def plain_result(text: str):
         return ("plain", text)
 
     @staticmethod
     def chain_result(chain):
+        assert isinstance(chain, list), "AstrBot chain_result requires a component list"
         return ("chain", chain)
 
 
-async def run():
-    cfg = m.KomariWatchConfig(komari_url="https://x.example.com", image_output=False,
-                              long_offline_remind_hours=1, panel_fail_cycles=3)
-    plugin = m.KomariWatchPlugin(None, cfg)
+async def collect(generator) -> list:
+    return [item async for item in generator]
 
-    # ---- pure helpers ----
-    check("config defaults", cfg.cpu_threshold == 90 and cfg.notify_restart is True)
-    check("parse_time numeric", m._parse_time(1757000000) is not None and m._parse_time(1757000000000) is not None)
-    check("parse_time iso", m._parse_time("2026-09-05T08:00:00Z") is not None)
-    check("parse_time junk", m._parse_time("abc") is None and m._parse_time(None) is None)
-    ws = m.KomariWatchPlugin._parse_ws_clients({"data": {"data": {"u1": '{"cpu": 10}', "u2": {"ram": 20}}, "online": ["u1"]}})
-    check("ws clients nested", len(ws) == 1 and ws[0]["uuid"] == "u1" and ws[0]["cpu"] == 10)
-    check("ws clients list", m.KomariWatchPlugin._parse_ws_clients({"data": [{"cpu": 1}]}) == [{"cpu": 1}])
-    check("ws clients flat", m.KomariWatchPlugin._parse_ws_clients({"u9": {"cpu": 1}})[0]["uuid"] == "u9")
-    check("metric cpu", m._metric({"cpu_usage": 0.5}, "cpu") == 50.0)
-    check("metric ram used/total", m._metric({"ram": {"used": 2, "total": 4}}, "memory") == 50.0)
 
-    # ---- rendering ----
-    nodes = [
-        {"uuid": "u1", "name": "n1", "is_online": True, "cpu_usage": 95, "memory_usage": 50, "disk_usage": 40,
-         "network": {"up": 1024, "down": 2048}, "load": {"load1": 0.5}, "uptime": 99999, "updated_at": "2026-09-05T07:59:00Z"},
-        {"uuid": "u2", "name": "n2<script>", "is_online": False},
-    ]
-    report = plugin._report_html(nodes)
-    check("report html stats", "共 2 节点" in report and "在线 1" in report and "离线 1" in report)
-    check("report html offline label", "状态：离线" in report)
-    check("report html escape", "<script>" not in report)
-    series = [{"cpu": 10, "ram": 20, "disk": 30, "net_in": 1024, "net_out": 512}] * 3
-    html_out = plugin._history_html({"u1": {"node": nodes[0], "series": series}}, 6)
-    check("history html traffic", "流量" in html_out and "polyline" in html_out)
-    check("history html offline dot", plugin._history_html({"u2": {"node": nodes[1], "series": series}}, 6).count("dot offline") == 1)
-    chart = m.KomariWatchPlugin._mini_chart("CPU", [10, 80, 40], "#f00", 6)
-    check("mini chart suffix", "当前 40.0%" in chart and "峰值 80.0%" in chart)
-    traffic = m.KomariWatchPlugin._traffic_chart(series, 6)
-    check("traffic chart values", "↑" in traffic and "峰值" in traffic)
-    text = plugin._history_text({"u1": {"node": nodes[0], "series": series}}, 6)
-    check("history text traffic", "流量 ↑" in text)
+async def run() -> None:
+    target_node = "test:GroupMessage:node-room"
+    target_all = "test:GroupMessage:ops-room"
+    context = FakeContext()
+    cfg = m.KomariGuardConfig(
+        komari_url="https://status.example.com",
+        image_output=False,
+        high_load_cycles=2,
+        offline_grace_cycles=2,
+        notification_routes=[
+            {"target_umo": target_node, "node": "node1", "alerts": True},
+            {"target_umo": target_node, "node": "~node1", "alerts": True},
+            {"target_umo": target_all, "node": "*", "alerts": True},
+        ],
+    )
+    plugin = m.KomariGuardPlugin(context, cfg)
 
-    # ---- alert engine ----
-    global SENT
-    sent = SENT
+    # Configuration, parser and metric regressions.
+    check("image output defaults private", m.KomariGuardConfig().image_output is False)
+    check("percent below one stays percent", m._metric({"cpu_usage": 0.5}, "cpu") == 0.5)
+    ws_node = {"cpu": 5.0, "ram": 2, "ram_total": 4, "disk": 3, "disk_total": 4}
+    check("ws scalar cpu", m._metric(ws_node, "cpu") == 5.0)
+    check("ws scalar ram", m._metric(ws_node, "memory") == 50.0)
+    check("ws scalar disk", m._metric(ws_node, "disk") == 75.0)
+    nested = {"cpu": {"usage": 0.8}, "ram": {"used": 1, "total": 4}}
+    check("nested percent stays percent", m._metric(nested, "cpu") == 0.8)
+    check("nested used total", m._metric(nested, "memory") == 25.0)
+    check("timestamp seconds and millis", m._parse_time(1757000000) is not None and m._parse_time(1757000000000) is not None)
+    check("empty ws snapshot recognized", m.KomariGuardPlugin._is_ws_snapshot({"data": {"online": [], "data": {}}}))
 
-    async def fake_send(text):
-        sent.append(text)
+    # Exact node routes do not leak node1 alerts to node10; ~ explicitly means substring.
+    node1 = {"uuid": "u1", "name": "node1"}
+    node10 = {"uuid": "u10", "name": "node10"}
+    exact = m.NotificationRoute(target_umo=target_node, node="node1")
+    fuzzy = m.NotificationRoute(target_umo=target_node, node="~node1")
+    check("route exact match", plugin._route_matches(exact, node1) and not plugin._route_matches(exact, node10))
+    check("route fuzzy match", plugin._route_matches(fuzzy, node10))
 
-    plugin._send = fake_send
-    plugin._stop.set()
-    plugin._start_monitor = lambda: None
-    plugin.state["targets"] = ["test:origin"]
+    # WS success with no clients means known-offline; total telemetry failure is an error.
+    static_nodes = [{"uuid": "u1", "name": "node1"}, {"uuid": "u2", "name": "node2"}]
 
+    async def static_ok():
+        return [dict(item) for item in static_nodes], None
+
+    async def ws_empty():
+        return [], True
+
+    plugin._nodes = static_ok
+    plugin._realtime = ws_empty
+    snapshot, error = await plugin._snapshot()
+    check("empty ws marks known offline", error is None and all(item["is_online"] is False for item in snapshot))
+
+    # The realtime command must retain its user-supplied selector while it marks
+    # merged nodes online/offline.
+    realtime_plugin = m.KomariGuardPlugin(FakeContext(), cfg)
+    realtime_plugin._start_monitor = lambda: None
+
+    async def realtime_nodes():
+        return [
+            {"uuid": "u1", "name": "alpha"},
+            {"uuid": "u10", "name": "beta"},
+        ], None
+
+    async def realtime_live():
+        return [
+            {"uuid": "u1", "cpu_usage": 10},
+            {"uuid": "u10", "cpu_usage": 20},
+        ], True
+
+    realtime_plugin._nodes = realtime_nodes
+    realtime_plugin._realtime = realtime_live
+    realtime_result = await collect(realtime_plugin.cmd_realtime(FakeEvent(), "alpha"))
+    realtime_text = realtime_result[0][1]
+    check("realtime keeps node selector", "alpha" in realtime_text and "beta" not in realtime_text)
+
+    async def ws_failed():
+        return [], False
+
+    async def history_failed(_nodes):
+        return [], set()
+
+    plugin._realtime = ws_failed
+    plugin._history_realtime = history_failed
+    snapshot, error = await plugin._snapshot()
+    check("telemetry failure is not offline", snapshot == [] and error is not None and "不判定节点离线" in error)
+
+    # Overlapping routes are de-duplicated per target.
+    context.sent.clear()
+    await plugin._dispatch_alerts([m.AlertMessage("node1 alert", node1)])
+    node_target_messages = [text for target, text in context.sent if target == target_node]
+    check("overlapping route dedup", node_target_messages == ["node1 alert"])
+    check("wildcard route delivery", any(target == target_all for target, _ in context.sent))
+
+    # Failed and muted sends remain in the persistent outbox and retry.
+    context.sent.clear()
+    context.fail_targets.add(target_node)
+    await plugin._dispatch_alerts([m.AlertMessage("retry me", node1)])
+    check("failed send queued", "retry me" in plugin.state.get("pending_alerts", {}).get(target_node, []))
+    context.fail_targets.clear()
+    await plugin._dispatch_alerts([])
+    check("failed send retried", any(target == target_node and "retry me" in text for target, text in context.sent))
+    plugin.state.setdefault("muted", {})[target_node] = 9999999999
+    await plugin._dispatch_alerts([m.AlertMessage("paused", node1)])
+    check("muted send queued", "paused" in plugin.state.get("pending_alerts", {}).get(target_node, []))
+    plugin.state["muted"].clear()
+    await plugin._dispatch_alerts([])
+    check("muted send delivered later", any(target == target_node and "paused" in text for target, text in context.sent))
+
+    # Alert engine: node-scoped target gets only node1, wildcard target gets both.
     live_nodes = [
-        {"uuid": "u1", "name": "node1", "is_online": True, "cpu_usage": 95, "memory_usage": 50,
-         "disk_usage": 40, "uptime": 99999, "updated_at": "2026-09-05T07:59:00Z"},
+        {"uuid": "u1", "name": "node1", "is_online": True, "cpu_usage": 95, "memory_usage": 40, "disk_usage": 30, "uptime": 1000},
         {"uuid": "u2", "name": "node2", "is_online": False},
     ]
 
-    async def ok_snapshot():
+    async def live_snapshot():
         return live_nodes, None
 
-    async def err_snapshot():
-        return [], "连接 Komari 失败：boom"
-
-    plugin._snapshot = ok_snapshot
+    plugin._snapshot = live_snapshot
+    context.sent.clear()
     await plugin._check_once()
     await plugin._check_once()
-    check("offline+high alerts", any("离线告警" in s and "node2" in s for s in sent)
-          and any("高负载告警" in s and "CPU 95.0%" in s for s in sent))
-    check("high details only exceeded", all("内存" not in s for s in sent if "高负载" in s))
+    scoped_text = "\n".join(text for target, text in context.sent if target == target_node)
+    wildcard_text = "\n".join(text for target, text in context.sent if target == target_all)
+    check("single node route isolation", "node1" in scoped_text and "node2" not in scoped_text)
+    check("wildcard receives offline and high", "node1" in wildcard_text and "node2" in wildcard_text)
 
-    # node restart
-    live_nodes[0]["uptime"] = 120
+    # Missing metrics do not manufacture a load-recovery event.
+    context.sent.clear()
+    live_nodes[0].pop("cpu_usage")
     await plugin._check_once()
-    check("restart alert", any("节点重启" in s and "此前已运行" in s for s in sent))
-
-    # recovery
-    live_nodes[1]["is_online"] = True
+    check("missing metric no recovery", all("负载恢复" not in text for _, text in context.sent))
+    live_nodes[0]["cpu_usage"] = 10
     await plugin._check_once()
-    check("recovery alert", any("节点恢复" in s for s in sent))
+    check("observed low metric recovers", any("负载恢复" in text for _, text in context.sent))
 
-    # long-offline daily reminder (alert re-trigger is blocked by cooldown,
-    # so build the active state directly to exercise the reminder branch)
-    live_nodes[1]["is_online"] = False
-    await plugin._check_once()
-    rec = plugin.state["nodes"]["u2"]
-    rec["active"]["offline"] = True
-    rec["offline_started"] -= 7200
-    await plugin._check_once()
-    check("long offline remind", any("仍离线" in s and "已离线" in s for s in sent))
+    # Each route owns its own daily progress marker.
+    schedule_cfg = m.KomariGuardConfig(
+        status_report_time="09:00",
+        notification_routes=[
+            {"target_umo": target_node, "node": "node1"},
+            {"target_umo": target_all, "node": "*"},
+        ],
+    )
+    schedule_plugin = m.KomariGuardPlugin(FakeContext(), schedule_cfg)
+    routes = schedule_plugin._routes()
+    noon = datetime(2026, 9, 17, 12, 0).timestamp()
+    check("both routes initially due", all(schedule_plugin._report_due(route, noon) for route in routes))
+    schedule_plugin.state.setdefault("report_sent", {})[schedule_plugin._route_key(routes[0])] = noon
+    check("daily progress isolated", not schedule_plugin._report_due(routes[0], noon) and schedule_plugin._report_due(routes[1], noon))
 
-    # panel failure and recovery
-    plugin._snapshot = err_snapshot
-    for _ in range(3):
-        await plugin._check_once()
-    check("panel down alert", any("面板不可达" in s for s in sent))
-    plugin._snapshot = ok_snapshot
-    await plugin._check_once()
-    check("panel recovery alert", any("面板已恢复" in s for s in sent))
+    # Binding uses the current full UMO and fixed optional parameters.
+    results = await collect(plugin.cmd_bind(FakeEvent(), "node1", "09:00", "daily"))
+    command_routes = [route for route in plugin.state["routes"] if route.get("target_umo") == FakeEvent.unified_msg_origin]
+    check("bind creates daily-only route", bool(results) and command_routes[-1]["alerts"] is False and command_routes[-1]["report_time"] == "09:00")
+    for name, method in inspect.getmembers(m.KomariGuardPlugin, inspect.isfunction):
+        if name.startswith("cmd_"):
+            check(f"fixed command signature {name}", all(param.kind is not inspect.Parameter.VAR_POSITIONAL for param in inspect.signature(method).parameters.values()))
 
-    # ---- commands ----
-    plugin._snapshot = ok_snapshot
-    results = [r async for r in plugin.komari_top(FakeEvent(), "mem", "3")]
-    check("top command", results and results[0][1].startswith("🏆") and "内存" in results[0][1])
-    results = [r async for r in plugin.komari_status(FakeEvent(), "不存在的节点")]
-    check("status no match", any("没有匹配" in r[1] for r in results))
-    results = [r async for r in plugin.komari_help(FakeEvent())]
-    check("help lists top", any("/komari_top" in r[1] for r in results))
+    # Passive image results pass component lists, matching AstrBot's real API.
+    image_plugin = m.KomariGuardPlugin(FakeContext(), m.KomariGuardConfig(image_output=True))
+    result = await image_plugin._report_result(FakeEvent(), [{"name": "n", "is_online": True}])
+    check("chain_result component list", result[0] == "chain" and isinstance(result[1], list))
 
-    plugin.state["muted"] = {}
-    plugin.state["targets"] = []
-    results = [r async for r in plugin.komari_mute(FakeEvent(), "30", "all")]
-    check("mute all no targets", any("没有绑定任何会话" in r[1] for r in results))
-    plugin.state["targets"] = []
-    sent.clear()
-    await plugin._check_once()
-    check("send respects empty targets", sent == [])
-    plugin.state["muted"] = {"test:origin": 9999999999}
-    sent.clear()
-    await plugin._check_once()
-    check("send respects mute", sent == [])
+    # Lifecycle starts and fully stops the background task.
+    lifecycle = m.KomariGuardPlugin(FakeContext(), m.KomariGuardConfig())
+    await lifecycle.initialize()
+    task = lifecycle._monitor_task
+    await asyncio.sleep(0)
+    await lifecycle.terminate()
+    check("lifecycle task cleaned", task is not None and task.done())
 
-    # ---- session creation (regression for the name-collision bug) ----
-    session = await plugin._get_session()
-    check("get session callable", session is not None and not session.closed)
-    await session.close()
-    check("no method/attr collision", plugin._session is None or isinstance(plugin._session, object))
+    # Public artifacts stay in sync with the runtime contract.
+    schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+    metadata = (ROOT / "metadata.yaml").read_text(encoding="utf-8")
+    check("schema routes and privacy default", "notification_routes" in schema and schema["image_output"]["default"] is False)
+    check("metadata renamed", "astrbot_plugin_komari_guard" in metadata and "astrbot_plugin_komari_watch" not in metadata)
 
 
-asyncio.run(run())
+with tempfile.TemporaryDirectory(prefix="komari-guard-test-") as temp_dir:
+    StarTools.data_dir = Path(temp_dir)
+    asyncio.run(run())
+
 print(f"PASS {len(PASS)} / FAIL {len(FAIL)}")
 if FAIL:
-    print("FAILED:", FAIL)
-    print("SENT MESSAGES:")
-    for s in SENT:
-        print("  --", s.replace("\n", " | "))
-    sys.exit(1)
+    print("FAILED:")
+    for item in FAIL:
+        print(" -", item)
+    raise SystemExit(1)
