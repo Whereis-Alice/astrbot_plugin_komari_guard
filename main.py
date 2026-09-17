@@ -37,7 +37,7 @@ else:
     )
 
 PLUGIN_ID = "astrbot_plugin_komari_guard"
-PLUGIN_VERSION = "2.1.1"
+PLUGIN_VERSION = "2.1.2"
 REPOSITORY_URL = "https://github.com/Whereis-Alice/astrbot_plugin_komari_guard"
 
 _MSG_TYPES = aiohttp.WSMsgType
