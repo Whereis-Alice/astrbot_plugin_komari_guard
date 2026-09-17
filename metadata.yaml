@@ -3,7 +3,7 @@ display_name: Komari Guard
 desc: >-
   Komari 节点监控与分流通知插件。支持按节点和会话路由离线、高负载、
   恢复与重启告警，并可为每条路由设置每日定时状态推送。
-version: v2.1.0
+version: v2.1.1
 author: Where-is-Alice
 repo: https://github.com/Whereis-Alice/astrbot_plugin_komari_guard
 astrbot_version: ">=4.16,<5"

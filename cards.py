@@ -101,17 +101,6 @@ def traffic(node: dict) -> dict[str, Any]:
             "used": used, "limit": number(node.get("traffic_limit")), "mode": mode}
 
 
-def billing(node: dict) -> str:
-    price, cycle = number(node.get("price")), number(node.get("billing_cycle"))
-    if price is None or price < 0:
-        return "未提供"
-    if price == 0:
-        return "免费"
-    unit = {30: "月", 31: "月", 365: "年", 366: "年"}.get(cycle)
-    period = unit or (f"{int(cycle)}天" if cycle and cycle > 0 else "周期未提供")
-    return f"{node.get('currency') or '¥'}{price:g} / {period}"
-
-
 def expiry(node: dict) -> str:
     value = node.get("expired_at")
     if not value:
@@ -241,8 +230,8 @@ def report_html(nodes: list[dict], *, metric: Callable, width: int = 900, scale:
         details += _details("配额统计方式", mode_name)
         details += _details("交换空间", "未启用" if total_swap == 0 else f"{size(used_swap)} / {size(total_swap)}")
         details += _details("进程 · TCP / UDP", f"{first(node.get('process'), '—')} · {first(tcp, '—')} / {first(udp, '—')}")
-        if node.get("price") is not None or node.get("expired_at"):
-            details += _details("费用", billing(node)) + _details("到期", expiry(node))
+        if node.get("expired_at"):
+            details += _details("到期", expiry(node), True)
         model = first(cpu.get("name"), node.get("cpu_name"))
         if model:
             details += _details("处理器", model, True)
