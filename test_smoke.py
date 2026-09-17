@@ -13,8 +13,11 @@ import logging
 import sys
 import tempfile
 import types
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
+
+from PIL import Image as PILImage
 
 ROOT = Path(__file__).resolve().parent
 
@@ -40,12 +43,17 @@ def _mock_astrbot() -> type:
             self.text = text
 
     class Image:
-        def __init__(self, url: str):
+        def __init__(self, url: str | None = None, data: bytes | None = None):
             self.url = url
+            self.data = data
 
         @staticmethod
         def fromURL(url: str):
             return Image(url)
+
+        @staticmethod
+        def fromBytes(data: bytes):
+            return Image(data=bytes(data))
 
     class MessageChain:
         def __init__(self, chain=None):
@@ -82,9 +90,17 @@ def _mock_astrbot() -> type:
     class Star:
         def __init__(self, context=None):
             self.context = context
+            self.html_render_calls: list[dict] = []
 
-        async def html_render(self, *_args, **_kwargs):
-            return "https://renderer.invalid/card.png"
+        async def html_render(self, *args, **kwargs):
+            self.html_render_calls.append({"args": args, "kwargs": kwargs})
+            render_dir = Path(StarTools.data_dir) / "renders"
+            render_dir.mkdir(parents=True, exist_ok=True)
+            image_path = render_dir / f"render-{len(self.html_render_calls)}.png"
+            image = PILImage.new("RGBA", (12, 10), (0, 0, 0, 0))
+            image.paste((32, 96, 160, 255), (3, 2, 9, 8))
+            image.save(image_path, format="PNG")
+            return str(image_path)
 
     class Context:
         pass
@@ -121,8 +137,7 @@ def _mock_astrbot() -> type:
 
 StarTools = _mock_astrbot()
 sys.path.insert(0, str(ROOT))
-import main as m  # noqa: E402
-
+import main as m
 
 PASS: list[str] = []
 FAIL: list[str] = []
@@ -186,6 +201,7 @@ async def run() -> None:
     cfg = m.KomariGuardConfig(
         komari_url="https://status.example.com",
         image_output=False,
+        network_probe_enabled=False,
         high_load_cycles=2,
         offline_grace_cycles=2,
         notification_routes=[
@@ -230,6 +246,40 @@ async def run() -> None:
     plugin._realtime = ws_empty
     snapshot, error = await plugin._snapshot()
     check("empty ws marks known offline", error is None and all(item["is_online"] is False for item in snapshot))
+
+    # History fills only missing metrics; valid realtime zeroes remain authoritative.
+    supplement_plugin = m.KomariGuardPlugin(
+        FakeContext(),
+        m.KomariGuardConfig(network_probe_enabled=False),
+    )
+
+    async def supplement_nodes():
+        return [{"uuid": "u-zero", "name": "zero-node"}], None
+
+    async def supplement_realtime():
+        return [{"uuid": "u-zero", "cpu_usage": 0, "disk_usage": 0}], True
+
+    async def supplement_history(nodes):
+        return ([{
+            "uuid": "u-zero",
+            "cpu_usage": 99,
+            "ram_usage": 50,
+            "disk_usage": 88,
+        }], {"u-zero"})
+
+    supplement_plugin._nodes = supplement_nodes
+    supplement_plugin._realtime = supplement_realtime
+    supplement_plugin._history_realtime = supplement_history
+    supplemented, supplement_error = await supplement_plugin._snapshot()
+    supplemented_node = supplemented[0]
+    check(
+        "history supplements missing metrics only",
+        supplement_error is None
+        and m._metric(supplemented_node, "cpu") == 0
+        and m._metric(supplemented_node, "memory") == 50
+        and m._metric(supplemented_node, "disk") == 0
+        and supplemented_node.get("_telemetry_source") == "实时快照 · 缺失项由历史补全",
+    )
 
     # The realtime command must retain its user-supplied selector while it marks
     # merged nodes online/offline.
@@ -317,6 +367,7 @@ async def run() -> None:
     # Each route owns its own daily progress marker.
     schedule_cfg = m.KomariGuardConfig(
         status_report_time="09:00",
+        network_probe_enabled=False,
         notification_routes=[
             {"target_umo": target_node, "node": "node1"},
             {"target_umo": target_all, "node": "*"},
@@ -324,7 +375,7 @@ async def run() -> None:
     )
     schedule_plugin = m.KomariGuardPlugin(FakeContext(), schedule_cfg)
     routes = schedule_plugin._routes()
-    noon = datetime(2026, 9, 17, 12, 0).timestamp()
+    noon = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc).timestamp()
     check("both routes initially due", all(schedule_plugin._report_due(route, noon) for route in routes))
     schedule_plugin.state.setdefault("report_sent", {})[schedule_plugin._route_key(routes[0])] = noon
     check("daily progress isolated", not schedule_plugin._report_due(routes[0], noon) and schedule_plugin._report_due(routes[1], noon))
@@ -424,18 +475,217 @@ async def run() -> None:
         if name.startswith("cmd_"):
             check(f"fixed command signature {name}", all(param.kind is not inspect.Parameter.VAR_POSITIONAL for param in inspect.signature(method).parameters.values()))
 
-    # Passive image results pass component lists, matching AstrBot's real API.
-    image_plugin = m.KomariGuardPlugin(FakeContext(), m.KomariGuardConfig(image_output=True))
+    # Passive image results use AstrBot's bytes component and renderer contract.
+    image_plugin = m.KomariGuardPlugin(
+        FakeContext(),
+        m.KomariGuardConfig(image_output=True, network_probe_enabled=False),
+    )
     result = await image_plugin._report_result(FakeEvent(), [{"name": "n", "is_online": True}])
+    image_component = result[1][0] if result[0] == "chain" and result[1] else None
+    cropped_size = None
+    if image_component is not None and image_component.data:
+        with PILImage.open(BytesIO(image_component.data)) as rendered:
+            cropped_size = rendered.size
     check("chain_result component list", result[0] == "chain" and isinstance(result[1], list))
+    check("image component uses png bytes", image_component is not None and image_component.data.startswith(b"\x89PNG"))
+    check("transparent render padding cropped", cropped_size == (6, 6))
+    render_call = image_plugin.html_render_calls[-1]
+    expected_options = {
+        "type": "png",
+        "quality": None,
+        "omit_background": True,
+        "full_page": True,
+        "viewport_width": 1800,
+        "viewport_height": 1,
+        "device_scale_factor_level": "normal",
+        "scale": "device",
+    }
+    check(
+        "html render options",
+        render_call["kwargs"].get("return_url") is False
+        and render_call["kwargs"].get("options") == expected_options,
+    )
+
+    # Network probes cache both task metadata and per-node records for 60 seconds.
+    recent_time = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat().replace("+00:00", "Z")
+    cache_tasks = {
+        "status": "success",
+        "data": [{
+            "id": 11,
+            "name": "China Telecom Shanghai",
+            "clients": ["node-a"],
+            "type": "icmp",
+            "interval": 60,
+        }],
+    }
+    cache_records = {
+        "status": "success",
+        "data": {"records": [{
+            "task_id": 11,
+            "time": recent_time,
+            "value": 32,
+            "client": "node-a",
+        }]},
+    }
+    cache_plugin = m.KomariGuardPlugin(
+        FakeContext(),
+        m.KomariGuardConfig(komari_url="https://status.example.com"),
+    )
+    cache_calls: list[str] = []
+
+    async def cache_get_json(endpoint: str):
+        cache_calls.append(endpoint)
+        return (cache_tasks, None) if endpoint == m.PING_TASKS_PATH else (cache_records, None)
+
+    cache_plugin._get_json = cache_get_json
+    cache_source = [{"uuid": "node-a", "name": "cache-node", "is_online": True}]
+    first_cached = await cache_plugin._with_network_probes(cache_source)
+    second_cached = await cache_plugin._with_network_probes(cache_source)
+    record_calls = [endpoint for endpoint in cache_calls if endpoint.startswith("/api/records/ping?")]
+    check(
+        "network probe cache",
+        cache_calls.count(m.PING_TASKS_PATH) == 1
+        and len(record_calls) == 1
+        and first_cached[0]["_network_probe"] == second_cached[0]["_network_probe"]
+        and "_network_probe" not in cache_source[0],
+    )
+
+    # Selecting one node must not fetch records for tasks assigned to other nodes.
+    isolation_tasks = {
+        "status": "success",
+        "data": [
+            {"id": 21, "name": "China Telecom A", "clients": ["node-a"], "interval": 60},
+            {"id": 22, "name": "China Unicom B", "clients": ["node-b"], "interval": 60},
+        ],
+    }
+    isolation_records = {
+        "status": "success",
+        "data": {"records": [{
+            "task_id": 21,
+            "time": recent_time,
+            "value": 24,
+            "client": "node-a",
+        }]},
+    }
+    isolation_plugin = m.KomariGuardPlugin(
+        FakeContext(),
+        m.KomariGuardConfig(komari_url="https://status.example.com"),
+    )
+    isolation_calls: list[str] = []
+
+    async def isolation_get_json(endpoint: str):
+        isolation_calls.append(endpoint)
+        return (isolation_tasks, None) if endpoint == m.PING_TASKS_PATH else (isolation_records, None)
+
+    isolation_plugin._get_json = isolation_get_json
+    isolated = await isolation_plugin._with_network_probes([{"uuid": "node-a", "name": "only-a"}])
+    isolated_record_calls = [endpoint for endpoint in isolation_calls if endpoint.startswith("/api/records/ping?")]
+    check(
+        "network probe node isolation",
+        len(isolated) == 1
+        and isolated[0]["name"] == "only-a"
+        and len(isolated_record_calls) == 1
+        and "uuid=node-a" in isolated_record_calls[0]
+        and "node-b" not in isolated_record_calls[0],
+    )
+
+    # A Komari deployment without the ping API still gets a complete resource card.
+    unavailable_plugin = m.KomariGuardPlugin(
+        FakeContext(),
+        m.KomariGuardConfig(image_output=True, komari_url="https://status.example.com"),
+    )
+    unavailable_calls: list[str] = []
+
+    async def unavailable_get_json(endpoint: str):
+        unavailable_calls.append(endpoint)
+        return None, "Komari API 返回 HTTP 404"
+
+    unavailable_plugin._get_json = unavailable_get_json
+    unavailable_result = await unavailable_plugin._report_result(
+        FakeEvent(),
+        [{
+            "uuid": "resource-node-id",
+            "name": "resource-node",
+            "is_online": True,
+            "cpu_usage": 42,
+            "ram": 512,
+            "ram_total": 1024,
+        }],
+    )
+    unavailable_html = unavailable_plugin.html_render_calls[-1]["args"][1]["content"]
+    unavailable_image = unavailable_result[1][0] if unavailable_result[0] == "chain" else None
+    check(
+        "probe api unavailable keeps resource card",
+        unavailable_calls == [m.PING_TASKS_PATH]
+        and unavailable_image is not None
+        and unavailable_image.data.startswith(b"\x89PNG")
+        and "resource-node" in unavailable_html
+        and "CPU" in unavailable_html
+        and "读取失败" in unavailable_html,
+    )
+
+    # Samples older than three task intervals are marked stale while remaining visible.
+    stale_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+    stale_tasks = {
+        "status": "success",
+        "data": [{
+            "id": 31,
+            "name": "China Mobile stale",
+            "clients": ["node-stale"],
+            "interval": 60,
+        }],
+    }
+    stale_records = {
+        "status": "success",
+        "data": {"records": [{
+            "task_id": 31,
+            "time": stale_time,
+            "value": 55,
+            "client": "node-stale",
+        }]},
+    }
+    stale_plugin = m.KomariGuardPlugin(
+        FakeContext(),
+        m.KomariGuardConfig(komari_url="https://status.example.com", network_probe_hours=1),
+    )
+
+    async def stale_get_json(endpoint: str):
+        return (stale_tasks, None) if endpoint == m.PING_TASKS_PATH else (stale_records, None)
+
+    stale_plugin._get_json = stale_get_json
+    stale_nodes = await stale_plugin._with_network_probes([{"uuid": "node-stale", "name": "stale"}])
+    stale_mobile = stale_nodes[0]["_network_probe"]["carriers"]["mobile"]
+    check(
+        "network probe stale state",
+        stale_mobile["status"] == "ok" and stale_mobile["latest_ms"] == 55 and stale_mobile["stale"] is True,
+    )
 
     # Lifecycle starts and fully stops the background task.
-    lifecycle = m.KomariGuardPlugin(FakeContext(), m.KomariGuardConfig())
+    lifecycle = m.KomariGuardPlugin(
+        FakeContext(),
+        m.KomariGuardConfig(network_probe_enabled=False),
+    )
     await lifecycle.initialize()
     task = lifecycle._monitor_task
     await asyncio.sleep(0)
     await lifecycle.terminate()
     check("lifecycle task cleaned", task is not None and task.done())
+
+    for instance in (
+        plugin,
+        supplement_plugin,
+        realtime_plugin,
+        schedule_plugin,
+        dashboard_plugin,
+        migration_plugin,
+        failure_plugin,
+        image_plugin,
+        cache_plugin,
+        isolation_plugin,
+        unavailable_plugin,
+        stale_plugin,
+    ):
+        await instance.terminate()
 
     # Public artifacts stay in sync with the runtime contract.
     schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))

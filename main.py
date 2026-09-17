@@ -7,8 +7,8 @@ import hashlib
 import html
 import json
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
@@ -21,8 +21,23 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star, StarTools
 
+if __package__:
+    from . import cards
+    from .card_render import crop_to_alpha_bounds
+    from .network_probe import (
+        PING_TASKS_PATH, ProbePayloadError, build_ping_records_path,
+        parse_ping_tasks, parse_timestamp, summarize_ping_payloads, unclassified_ping_tasks,
+    )
+else:
+    import cards
+    from card_render import crop_to_alpha_bounds
+    from network_probe import (
+        PING_TASKS_PATH, ProbePayloadError, build_ping_records_path,
+        parse_ping_tasks, parse_timestamp, summarize_ping_payloads, unclassified_ping_tasks,
+    )
+
 PLUGIN_ID = "astrbot_plugin_komari_guard"
-PLUGIN_VERSION = "2.0.1"
+PLUGIN_VERSION = "2.1.0"
 REPOSITORY_URL = "https://github.com/Whereis-Alice/astrbot_plugin_komari_guard"
 
 _MSG_TYPES = aiohttp.WSMsgType
@@ -58,6 +73,10 @@ class KomariGuardConfig(BaseModel):
     komari_token: str = Field("", description="API Token 或 Session Token")
     image_output: bool = Field(False, description="以图片卡片发送状态报告")
     image_width: int = Field(900, ge=500, le=1600, description="状态图片宽度")
+    image_scale: int = Field(2, ge=1, le=3, description="图片清晰度倍率")
+    network_probe_enabled: bool = True
+    network_probe_hours: int = Field(1, ge=1, le=24)
+    network_probe_tasks: dict[str, int] = Field(default_factory=dict)
     poll_interval: int = Field(60, ge=15, le=3600)
     offline_grace_cycles: int = Field(2, ge=1, le=10)
     cpu_threshold: float = Field(90, ge=1, le=100)
@@ -96,14 +115,13 @@ def _parse_time(value: Any) -> Optional[datetime]:
     else:
         if not isinstance(value, str) or not value:
             return None
+        result = parse_timestamp(value)
+        if result is not None:
+            return result
         try:
-            result = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return result.replace(tzinfo=timezone.utc) if result.tzinfo is None else result
+            ts = float(value)
         except ValueError:
-            try:
-                ts = float(value)
-            except ValueError:
-                return None
+            return None
     if ts > 1e12:
         ts /= 1000
     try:
@@ -184,6 +202,9 @@ class KomariGuardPlugin(Star):
         self._failure_count = 0
         self._filter_warned = False
         self._route_warnings: set[str] = set()
+        self._probe_lock = asyncio.Lock()
+        self._probe_tasks_cache: tuple[float, Any, Optional[str]] = (0, None, None)
+        self._probe_nodes_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     def _load_state(self) -> dict[str, Any]:
         try:
@@ -653,9 +674,14 @@ class KomariGuardPlugin(Star):
             item["disk"] = {"used": latest["disk"], "total": latest.get("disk_total") or node.get("disk_total") or 0}
         if latest.get("disk_percent") is not None:
             item["disk_usage"] = latest["disk_percent"]
-        if latest.get("net_in") is not None or latest.get("net_out") is not None:
-            item["network"] = {"down": latest.get("net_in", 0), "up": latest.get("net_out", 0)}
+        item["network"] = {"down": latest.get("net_in"), "up": latest.get("net_out"),
+                           "totalUp": latest.get("net_total_up"), "totalDown": latest.get("net_total_down")}
         item["load"] = {"load1": latest.get("load", "-")}
+        for field in ("swap", "swap_total", "traffic_up", "traffic_down", "process", "connections", "connections_udp"):
+            if latest.get(field) is not None:
+                item[field] = latest[field]
+        item["_telemetry_source"] = "历史记录兜底"
+        item["_telemetry_time"] = latest.get("time")
         return item, True
 
     async def _history_realtime(self, nodes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], set[str]]:
@@ -709,16 +735,7 @@ class KomariGuardPlugin(Star):
         return bool(updated and (datetime.now(timezone.utc) - updated).total_seconds() < freshness_window)
 
     def _format_report(self, nodes: list[dict[str, Any]]) -> str:
-        lines = ["📡 Komari 服务器状态"]
-        for node in nodes:
-            name = node.get("name") or node.get("hostname") or node.get("id") or "未知节点"
-            status = node.get("is_online")
-            online = "在线" if status is True else ("离线" if status is False else "未知")
-            icon = "🟢" if status is True else ("🔴" if status is False else "🟡")
-            cpu, memory, disk = _metric(node, "cpu"), _metric(node, "memory"), _metric(node, "disk")
-            metrics = " / ".join(f"{label} {value:.1f}%" for value, label in ((cpu, "CPU"), (memory, "内存"), (disk, "磁盘")) if value is not None)
-            lines.append(f"\n{icon} {name} · {online}{(' · ' + metrics) if metrics else ''}")
-        return "\n".join(lines) if len(lines) > 1 else "Komari 没有返回节点。"
+        return cards.report_text(nodes, metric=_metric)
 
     @staticmethod
     def _reltime(value: Any) -> str:
@@ -776,58 +793,11 @@ class KomariGuardPlugin(Star):
         return "".join(parts)
 
     def _page_html(self, title: str, subtitle: str, body: str, stats: str = "") -> str:
-        return f'''<!doctype html><html><head><meta charset="utf-8"><style>
-        *{{box-sizing:border-box}} body{{width:{self.config.image_width}px;margin:0;padding:14px;background:#e8efed;font-family:"Microsoft YaHei",sans-serif;color:#173b3f}}
-        .wrap{{background:#f8fbfa;border:1px solid #d7e3e0;border-radius:20px;padding:18px;box-shadow:0 10px 24px #173b3f22}} .top{{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}}
-        .tag{{background:#0f766e;border-radius:8px;padding:11px 18px;color:#fff;font-size:23px;font-weight:700}} .stamp{{background:#173b3f;color:#fff;border-radius:8px;padding:11px 16px;font-size:16px;font-weight:700}}
-        h1{{font-size:29px;margin:0 0 4px}} .sub{{color:#647876;font-size:15px}} .grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}}
-        .card{{background:#fff;border:1px solid #dce7e5;border-radius:8px;padding:16px;box-shadow:0 2px 8px #173b3f12}} .node-head,.metric>div,.facts{{display:flex;justify-content:space-between;align-items:center}} .node-head{{margin-bottom:14px;font-size:18px}} .node-head small{{font-size:13px;color:#647876}} .dot{{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:9px}} .online{{background:#19a974}} .offline{{background:#e45757}} .unknown{{background:#f5a623}}
-        .metric{{margin:10px 0}} .metric>div{{font-size:14px;color:#647876}} .metric b{{color:#173b3f}} .metric i{{display:block;height:8px;background:#e8efed;border-radius:8px;margin-top:6px;overflow:hidden}} .metric em{{display:block;height:100%;border-radius:8px}} .facts{{flex-wrap:wrap;gap:8px;margin-top:17px;color:#647876;font-size:12px}} .updated{{border-top:1px solid #e1e9e7;margin-top:14px;padding-top:11px;color:#839491;font-size:11px}} .empty{{padding:40px;text-align:center;color:#647876}}
-        .chart{{width:100%;height:72px;display:block;background:#f8fbfa;border-radius:6px;margin-top:6px}} .chartinfo{{font-size:13px;color:#647876;margin-top:10px}}
-        .stats{{display:flex;gap:10px;margin:15px 0 2px}} .pill{{background:#fff;border:1px solid #dce7e5;border-radius:999px;padding:7px 15px;font-size:14px;font-weight:700;color:#647876}} .pill.ok{{color:#12815b}} .pill.bad{{color:#d44747}}
-        </style></head><body><main class="wrap"><div class="top"><span class="tag">Komari Guard</span><span class="stamp">{datetime.now().strftime('%Y-%m-%d %H:%M')}</span></div><h1>{title}</h1><div class="sub">{subtitle}</div>{f'<div class="stats">{stats}</div>' if stats else ''}<div class="grid">{body}</div></main></body></html>'''
+        return cards.page_html(title, subtitle, body, stats, width=self.config.image_width,
+                               single=self.config.image_width < 800, scale=self.config.image_scale)
 
     def _report_html(self, nodes: list[dict[str, Any]]) -> str:
-        """Build a self-contained card; no external assets or copied template."""
-        cards: list[str] = []
-        for node in nodes:
-            name = html.escape(str(node.get("name") or node.get("hostname") or node.get("id") or "未知节点"))
-            status = node.get("is_online")
-            online = status is True
-            status_label = "在线" if status is True else ("离线" if status is False else "未知")
-            status_class = "online" if status is True else ("offline" if status is False else "unknown")
-            cpu, memory, disk = _metric(node, "cpu"), _metric(node, "memory"), _metric(node, "disk")
-            network = node.get("network") if isinstance(node.get("network"), dict) else {}
-            load = node.get("load") if isinstance(node.get("load"), dict) else {}
-            def progress(label: str, value: Optional[float], color: str) -> str:
-                shown = "-" if value is None else f"{value:.1f}%"
-                width = 0 if value is None else min(max(value, 0), 100)
-                return f'<div class="metric"><div><span>{label}</span><b>{shown}</b></div><i><em style="width:{width}%;background:{color}"></em></i></div>'
-            rel = self._reltime(node.get("updated_at") or node.get("last_seen"))
-            if status is None:
-                updated = "遥测状态：暂时不可用"
-            elif online:
-                updated = f"更新时间：{html.escape(rel)}"
-            elif rel != "等待心跳":
-                updated = f"最后在线：{html.escape(rel)}"
-            else:
-                updated = "状态：离线"
-            cards.append(f'''<section class="card"><div class="node-head"><div><span class="dot {status_class}"></span><strong>{name}</strong></div><small>{status_label}</small></div>
-                {progress('CPU', cpu, '#f25f5c')}{progress('内存', memory, '#f5a623')}{progress('磁盘', disk, '#0ea5a6')}
-                <div class="facts"><span>上行 {html.escape(self._fmt_speed(network.get('up')))}</span><span>下行 {html.escape(self._fmt_speed(network.get('down')))}</span><span>负载 {html.escape(str(load.get('load1', '-')))}</span><span>运行 {html.escape(self._fmt_uptime(node.get('uptime')))}</span></div>
-                <div class="updated">{updated}</div></section>''')
-        body = "".join(cards) or '<div class="empty">Komari 没有返回节点数据</div>'
-        total = len(nodes)
-        online_count = sum(1 for node in nodes if node.get("is_online") is True)
-        offline_count = sum(1 for node in nodes if node.get("is_online") is False)
-        unknown_count = total - online_count - offline_count
-        stats = (f'<span class="pill">共 {total} 节点</span><span class="pill ok">在线 {online_count}</span>'
-                 f'<span class="pill bad">离线 {offline_count}</span>'
-                 f'<span class="pill">未知 {unknown_count}</span>') if nodes and unknown_count else (
-                     f'<span class="pill">共 {total} 节点</span><span class="pill ok">在线 {online_count}</span>'
-                     f'<span class="pill bad">离线 {offline_count}</span>' if nodes else ""
-                 )
-        return self._page_html("服务器运行状态", "实时资源概览 · 自动刷新由 AstrBot 监控任务负责", body, stats)
+        return cards.report_html(nodes, metric=_metric, width=self.config.image_width, scale=self.config.image_scale)
 
     @staticmethod
     def _mini_chart(label: str, values: list[Any], color: str, hours: int) -> str:
@@ -911,19 +881,94 @@ class KomariGuardPlugin(Star):
         if not self.config.image_output:
             return MessageChain().message(text_fallback)
         try:
-            image_url = await self.html_render(html_text, {"content": html_text}, options={"type": "jpeg", "quality": 92, "full_page": True})
-            if image_url:
-                return MessageChain([Image.fromURL(image_url)])
+            image_path = await self.html_render(
+                "{{ content | safe }}", {"content": html_text}, return_url=False,
+                options={
+                    "type": "png", "quality": None, "omit_background": True,
+                    "full_page": True, "viewport_width": self.config.image_width * self.config.image_scale,
+                    "viewport_height": 1, "device_scale_factor_level": "normal", "scale": "device",
+                },
+            )
+            if image_path:
+                png_bytes = await asyncio.to_thread(crop_to_alpha_bounds, image_path)
+                return MessageChain([Image.fromBytes(png_bytes)])
         except Exception as exc:
             self.logger.warning("状态卡片渲染失败，回退文本：%s", exc)
         return MessageChain().message(text_fallback)
 
+    async def _with_network_probes(self, nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Enrich report copies only, with one bounded request per uncached node."""
+        output = [dict(node) for node in nodes]
+        pending = [node for node in output if "_network_probe" not in node]
+        if not pending:
+            return output
+        hours = self.config.network_probe_hours
+        if not self.config.network_probe_enabled:
+            for node in pending:
+                node["_network_probe"] = {"status": "disabled", "hours": hours}
+            return output
+        async with self._probe_lock:
+            now = time.monotonic()
+            cached_at, tasks_payload, tasks_error = self._probe_tasks_cache
+            if not cached_at or now - cached_at >= 60:
+                tasks_payload, tasks_error = await self._get_json(PING_TASKS_PATH)
+                self._probe_tasks_cache = (now, tasks_payload, tasks_error)
+            try:
+                tasks = parse_ping_tasks(tasks_payload) if not tasks_error else []
+            except ProbePayloadError:
+                tasks, tasks_error = [], "无法解析 Ping 任务"
+            semaphore = asyncio.Semaphore(_HISTORY_CONCURRENCY)
+
+            async def enrich(node: dict[str, Any]) -> None:
+                uuid = self._node_key(node)
+                cached = self._probe_nodes_cache.get(uuid)
+                if cached and now - cached[0] < 60:
+                    node["_network_probe"] = cached[1]
+                    return
+                detail: dict[str, Any] = {"hours": hours, "status": "unavailable"}
+                if not tasks_error and tasks_payload is not None and uuid:
+                    applicable = [task for task in tasks if task.applies_to(uuid)]
+                    records: Any = {"data": {"records": []}}
+                    error = None
+                    if applicable:
+                        async with semaphore:
+                            records, error = await self._get_json(build_ping_records_path(node_uuid=uuid, hours=hours))
+                    if not error:
+                        try:
+                            stamp = datetime.now(timezone.utc)
+                            summaries = summarize_ping_payloads(
+                                tasks_payload, records, node_uuid=uuid,
+                                task_overrides=self.config.network_probe_tasks,
+                                window_start=stamp - timedelta(hours=hours), window_end=stamp,
+                            )
+                            entries = {}
+                            by_id = {task.task_id: task for task in applicable}
+                            for carrier, summary in summaries.items():
+                                entry = asdict(summary)
+                                interval = max((by_id[tid].interval_seconds or 60 for tid in summary.task_ids if tid in by_id), default=60)
+                                entry["stale"] = bool(summary.latest_at and (stamp - summary.latest_at).total_seconds() > max(interval * 3, 180))
+                                entries[carrier.value] = entry
+                            detail.update(status="ok", carriers=entries,
+                                          unclassified=bool(unclassified_ping_tasks(tasks, node_uuid=uuid)))
+                        except (ProbePayloadError, ValueError, TypeError):
+                            self.logger.debug("无法解析节点 %s 的三网探测数据", uuid)
+                node["_network_probe"] = detail
+                if uuid:
+                    self._probe_nodes_cache[uuid] = (now, detail)
+
+            await asyncio.gather(*(enrich(node) for node in pending))
+            # Bound cache lifetime as nodes disappear from the panel.
+            self._probe_nodes_cache = {key: value for key, value in self._probe_nodes_cache.items() if now - value[0] < 120}
+        return output
+
     async def _report_chain(self, nodes: list[dict[str, Any]]) -> MessageChain:
+        nodes = await self._with_network_probes(nodes)
         return await self._chain_from_html(self._report_html(nodes), self._format_report(nodes))
 
     async def _report_result(self, event: AstrMessageEvent, nodes: list[dict[str, Any]]):
         if not nodes:
             return event.plain_result("Komari 没有返回节点。")
+        nodes = await self._with_network_probes(nodes)
         if not self.config.image_output:
             return event.plain_result(self._format_report(nodes))
         chain = await self._report_chain(nodes)
@@ -1318,6 +1363,7 @@ class KomariGuardPlugin(Star):
             stamp = datetime.now(timezone.utc).isoformat()
             for item in live:
                 item.setdefault("updated_at", stamp)
+                item["_telemetry_source"] = "实时快照"
             # 只为缺失内存/磁盘指标的在线节点拉历史记录补全展示，
             # 不再因个别节点缺指标而对全部节点发起 N 次请求。
             lacking = [item for item in live if _metric(item, "memory") is None or _metric(item, "disk") is None]
@@ -1328,13 +1374,23 @@ class KomariGuardPlugin(Star):
                     fallback = history_by_key.get(self._node_key(item))
                     if not fallback:
                         continue
-                    for field in ("cpu_usage", "ram_usage", "disk_usage"):
-                        if item.get(field) is None and fallback.get(field) is not None:
-                            item[field] = fallback[field]
-                    for section in ("cpu", "ram", "memory", "disk", "storage", "network", "load"):
+                    item["_telemetry_source"] = "实时快照 · 缺失项由历史补全"
+                    for metric_name, fields in (
+                        ("cpu", ("cpu_usage", "cpu")),
+                        ("memory", ("ram_usage", "ram", "memory")),
+                        ("disk", ("disk_usage", "disk", "storage")),
+                    ):
+                        if _metric(item, metric_name) is None:
+                            for field in fields:
+                                if fallback.get(field) is not None:
+                                    item[field] = fallback[field]
+                    for section in ("network", "load"):
                         if isinstance(fallback.get(section), dict):
                             current = item.get(section)
-                            item[section] = {**fallback[section], **current} if isinstance(current, dict) else fallback[section]
+                            if isinstance(current, dict):
+                                item[section] = {**fallback[section], **{key: value for key, value in current.items() if value is not None}}
+                            elif current is None:
+                                item[section] = fallback[section]
         else:
             live, history_success = await self._history_realtime(static)
             if static and not history_success:

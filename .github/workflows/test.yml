@@ -24,5 +24,6 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Compile and run regressions
         run: |
-          python -m py_compile main.py test_smoke.py
+          python -m py_compile main.py cards.py card_render.py network_probe.py
           python test_smoke.py
+          python -m unittest test_cards test_card_render test_network_probe

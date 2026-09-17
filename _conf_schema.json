@@ -55,9 +55,39 @@
   },
   "image_width": {
     "type": "int",
-    "description": "状态图片宽度",
+    "description": "状态卡片布局宽度",
+    "hint": "实际 PNG 宽度 = 布局宽度 × 清晰度倍率；低于 800 时始终单列",
     "default": 900,
     "slider": {"min": 500, "max": 1600, "step": 50}
+  },
+  "image_scale": {
+    "type": "int",
+    "description": "图片清晰度倍率",
+    "hint": "默认 2 倍，900 布局宽度输出 1800 像素 PNG；3 倍更清晰但文件更大",
+    "default": 2,
+    "slider": {"min": 1, "max": 3, "step": 1}
+  },
+  "network_probe_enabled": {
+    "type": "bool",
+    "description": "展示三网探测结果",
+    "hint": "读取 Komari 已有 Ping 任务；不会自动创建任务或主动探测。未配置任务会如实显示未配置",
+    "default": true
+  },
+  "network_probe_hours": {
+    "type": "int",
+    "description": "三网丢包统计窗口（小时）",
+    "default": 1,
+    "slider": {"min": 1, "max": 24, "step": 1}
+  },
+  "network_probe_tasks": {
+    "type": "object",
+    "description": "三网 Ping 任务 ID",
+    "hint": "0 表示按任务名自动识别运营商；同运营商有多个任务时请指定一个任务 ID。任务需在 Komari 中分配给目标节点",
+    "items": {
+      "telecom": {"type": "int", "description": "电信任务 ID", "default": 0},
+      "unicom": {"type": "int", "description": "联通任务 ID", "default": 0},
+      "mobile": {"type": "int", "description": "移动任务 ID", "default": 0}
+    }
   },
   "poll_interval": {
     "type": "int",
