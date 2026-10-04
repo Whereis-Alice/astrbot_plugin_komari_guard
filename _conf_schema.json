@@ -46,6 +46,24 @@
       }
     }
   },
+  "expiry_reminder_enabled": {
+    "type": "bool",
+    "description": "启用服务器续费提醒",
+    "hint": "需要配置下方独立会话列表；不会使用普通通知路由。/kg eb 可绑定当前会话并启用",
+    "default": false
+  },
+  "expiry_reminder_days": {
+    "type": "string",
+    "description": "续费提醒提前天数",
+    "hint": "逗号分隔的 1–365 整数，例如 7,3,1；每档按到期前 N×24 小时计算，首次检查只发送当前最接近到期的一档",
+    "default": "7,3,1"
+  },
+  "expiry_notification_targets": {
+    "type": "list",
+    "description": "续费提醒专用通知会话",
+    "hint": "可填多个完整 UMO，例如 platform-instance:GroupMessage:123456，不能只填群号。留空不发送；与 notification_routes 独立。/kg eb 绑定，/kg eu 解绑，/kg er 查看",
+    "default": []
+  },
   "image_output": {
     "type": "bool",
     "description": "状态和日报使用图片卡片",

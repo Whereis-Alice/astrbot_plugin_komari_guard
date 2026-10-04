@@ -14,7 +14,7 @@ from typing import Any, Optional
 from urllib.parse import quote
 
 import aiohttp
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -24,6 +24,7 @@ from astrbot.api.star import Context, Star, StarTools
 if __package__:
     from . import cards
     from .card_render import crop_to_alpha_bounds
+    from .expiry_reminder import expiry_notice, normalize_reminder_days, reminder_days
     from .network_probe import (
         PING_TASKS_PATH, ProbePayloadError, build_ping_records_path,
         parse_ping_tasks, parse_timestamp, summarize_ping_payloads, unclassified_ping_tasks,
@@ -31,13 +32,14 @@ if __package__:
 else:
     import cards
     from card_render import crop_to_alpha_bounds
+    from expiry_reminder import expiry_notice, normalize_reminder_days, reminder_days
     from network_probe import (
         PING_TASKS_PATH, ProbePayloadError, build_ping_records_path,
         parse_ping_tasks, parse_timestamp, summarize_ping_payloads, unclassified_ping_tasks,
     )
 
 PLUGIN_ID = "astrbot_plugin_komari_guard"
-PLUGIN_VERSION = "2.1.2"
+PLUGIN_VERSION = "2.2.0"
 REPOSITORY_URL = "https://github.com/Whereis-Alice/astrbot_plugin_komari_guard"
 
 _MSG_TYPES = aiohttp.WSMsgType
@@ -94,10 +96,23 @@ class KomariGuardConfig(BaseModel):
     panel_fail_cycles: int = Field(3, ge=0, le=10, description="面板连续失败多少个周期后推送不可达告警，0 表示关闭")
     notify_restart: bool = True
     long_offline_remind_hours: int = Field(0, ge=0, le=720, description="节点离线超过多少小时后每日提醒一次，0 表示关闭")
+    expiry_reminder_enabled: bool = False
+    expiry_reminder_days: str = "7,3,1"
+    expiry_notification_targets: list[str] = Field(default_factory=list)
     notification_routes: list[NotificationRoute] = Field(
         default_factory=list,
         description="按会话、节点与时刻分发告警和日报",
     )
+
+    @field_validator("expiry_reminder_days")
+    @classmethod
+    def validate_expiry_days(cls, value: str) -> str:
+        return normalize_reminder_days(value)
+
+    @field_validator("expiry_notification_targets")
+    @classmethod
+    def normalize_expiry_targets(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(value.strip() for value in values if value.strip()))
 
 
 def _num(value: Any) -> Optional[float]:
@@ -198,6 +213,7 @@ class KomariGuardPlugin(Star):
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
         self._route_config_lock = asyncio.Lock()
+        self._expiry_lock = asyncio.Lock()
         self._monitor_task: Optional[asyncio.Task] = None
         self._failure_count = 0
         self._filter_warned = False
@@ -404,6 +420,53 @@ class KomariGuardPlugin(Star):
 
     def _targets(self) -> list[str]:
         return list(dict.fromkeys(route.target_umo for route in self._routes()))
+
+    def _expiry_targets(self) -> list[str]:
+        if not self.config.expiry_reminder_enabled:
+            return []
+        targets = []
+        for target in self.config.expiry_notification_targets:
+            target = target.strip()
+            if self._valid_umo(target):
+                targets.append(target)
+            else:
+                self._warn_route(f"expiry:{target}", "忽略无效续费通知 UMO %r，请填写完整会话标识。", target)
+        return list(dict.fromkeys(targets))
+
+    def _all_notification_targets(self) -> list[str]:
+        # Ordinary routing intentionally never includes these independent targets.
+        return list(dict.fromkeys([*self._targets(), *self._expiry_targets()]))
+
+    async def _persist_expiry_settings(self, targets: list[str], *, enable: bool | None = None) -> Optional[str]:
+        if self._astrbot_config is None:
+            return "当前 AstrBot 未提供可保存的配置对象，请在配置页设置续费通知会话。"
+        targets = list(dict.fromkeys(target.strip() for target in targets if target.strip()))
+        updates: dict[str, Any] = {"expiry_notification_targets": targets}
+        if enable is not None:
+            updates["expiry_reminder_enabled"] = enable
+        before_raw = {key: (key in self._astrbot_config, copy.deepcopy(self._astrbot_config.get(key))) for key in updates}
+        before_runtime = {key: copy.deepcopy(getattr(self.config, key)) for key in updates}
+        try:
+            for key, value in updates.items():
+                self._astrbot_config[key] = value
+                setattr(self.config, key, value)
+            save_async = getattr(self._astrbot_config, "save_config_async", None)
+            if callable(save_async):
+                saved = await save_async()
+            else:
+                saved = await asyncio.to_thread(self._astrbot_config.save_config)
+            if saved is False:
+                raise OSError("配置保存接口返回失败")
+            return None
+        except Exception as exc:
+            for key, (existed, value) in before_raw.items():
+                if existed:
+                    self._astrbot_config[key] = value
+                else:
+                    self._astrbot_config.pop(key, None)
+                setattr(self.config, key, before_runtime[key])
+            self.logger.exception("保存续费通知配置失败")
+            return f"保存续费通知配置失败：{exc}"
 
     @staticmethod
     def _route_key(route: NotificationRoute) -> str:
@@ -1097,6 +1160,77 @@ class KomariGuardPlugin(Star):
         """Compatibility helper for panel-wide notifications."""
         await self._dispatch_alerts([AlertMessage(text)])
 
+    async def _check_expiry_once(self, now: datetime | None = None) -> bool:
+        """Use static metadata even when all realtime/history telemetry is down.
+
+        Unsent stages are recomputed on every poll instead of queuing stale text.
+        A renewed/removed/expired node therefore cannot produce an old reminder.
+        """
+        async with self._expiry_lock:
+            targets = self._expiry_targets()
+            if not targets:
+                return False
+            try:
+                nodes, error = await self._nodes()
+            except Exception as exc:
+                self.logger.warning("读取续费提醒节点失败，下轮重试：%s", exc)
+                return True
+            if error:
+                self.logger.warning("续费检查失败，下轮重试：%s", error)
+                return True
+            now = now or datetime.now(timezone.utc)
+            days = reminder_days(self.config.expiry_reminder_days)
+            notices = {}
+            for node in self._visible(nodes):
+                notice = expiry_notice(node, days, now)
+                if notice is not None:
+                    notices[notice.node_key] = notice
+
+            history = self.state.get("expiry_reminders")
+            if not isinstance(history, dict):
+                history = {}
+                self.state["expiry_reminders"] = history
+            known_keys = {self._node_key(node) for node in nodes}
+            changed = False
+            for target in list(history):
+                if target not in targets or not isinstance(history[target], dict):
+                    del history[target]
+                    changed = True
+                    continue
+                for key in list(history[target]):
+                    if key not in known_keys:
+                        del history[target][key]
+                        changed = True
+            failed = False
+            for target in targets:
+                if self._muted(target):
+                    continue
+                sent = history.setdefault(target, {})
+                due = []
+                for notice in notices.values():
+                    previous = sent.get(notice.node_key)
+                    if isinstance(previous, dict) and previous.get("expires_at") == notice.expires_at:
+                        threshold = previous.get("threshold")
+                        if isinstance(threshold, int) and not isinstance(threshold, bool) and 1 <= threshold <= notice.threshold:
+                            continue
+                    due.append(notice)
+                # Keep proactive messages within typical chat-platform size limits.
+                for offset in range(0, len(due), 10):
+                    batch = due[offset:offset + 10]
+                    text = "\n\n".join(notice.text for notice in batch)
+                    if not await self._send_target(target, MessageChain().message(text)):
+                        failed = True
+                        continue
+                    for notice in batch:
+                        sent[notice.node_key] = {"expires_at": notice.expires_at, "threshold": notice.threshold}
+                    self._append_alert(text)
+                    # Save after each acknowledged batch, not at the end of all targets.
+                    self._save_state()
+                    changed = False
+            if changed:
+                self._save_state()
+            return failed
+
     def _report_due(self, route: NotificationRoute, now: float) -> bool:
         sent = self.state.get("report_sent")
         if not isinstance(sent, dict):
@@ -1326,8 +1460,15 @@ class KomariGuardPlugin(Star):
             while not self._stop.is_set():
                 failed = False
                 try:
-                    if self._targets() and self.config.komari_url:
-                        failed = await self._check_once()
+                    if self.config.komari_url:
+                        if self._expiry_targets():
+                            try:
+                                failed = await self._check_expiry_once()
+                            except Exception:
+                                failed = True
+                                self.logger.exception("续费检查异常，将在下轮重试")
+                        if self._targets():
+                            failed = await self._check_once() or failed
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -1516,6 +1657,7 @@ class KomariGuardPlugin(Star):
             "/kg b [节点|*] [HH:MM] [alert|daily|both] - 绑定当前会话",
             "/kg ub [节点|*] - 解除当前会话的命令路由",
             "/kg r - 查看推送路由",
+            "/kg eb / /kg eu / /kg er - 绑定/解绑/查看独立续费通知会话",
             "/kg m [分钟] [all] / /kg um [all] - 静默/恢复",
             "/kg a - 最近告警；/kg ck - 立即检查",
             "/kg i / /kg v - 站点信息/服务端版本",
@@ -1615,6 +1757,62 @@ class KomariGuardPlugin(Star):
         version = data.get("version", "未知")
         commit = data.get("hash") or data.get("commit") or ""
         yield event.plain_result(f"Komari 版本：{version}{f' ({commit})' if commit else ''}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @kg.command("eb")
+    async def cmd_expiry_bind(self, event: AstrMessageEvent):
+        """独立绑定当前会话接收续费提醒，并开启续费提醒。"""
+        target = str(event.unified_msg_origin)
+        if not self._valid_umo(target) or not self._supports_proactive_message(event):
+            yield event.plain_result("当前会话没有有效 UMO，或平台不支持主动消息。")
+            return
+        async with self._expiry_lock, self._route_config_lock:
+            error = await self._persist_expiry_settings([*self.config.expiry_notification_targets, target], enable=True)
+        if error:
+            yield event.plain_result(f"❌ {error}")
+            return
+        self._start_monitor()
+        yield event.plain_result(
+            "✅ 已绑定当前会话的续费提醒，并启用续费检查。\n"
+            f"提前天数：{self.config.expiry_reminder_days}\n"
+            "已写入 expiry_notification_targets，刷新配置页可见；不改变普通告警/日报路由。"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @kg.command("eu")
+    async def cmd_expiry_unbind(self, event: AstrMessageEvent):
+        """只从续费提醒会话列表中删除当前会话。"""
+        target = str(event.unified_msg_origin)
+        async with self._expiry_lock, self._route_config_lock:
+            if target not in self.config.expiry_notification_targets:
+                yield event.plain_result("当前会话未绑定续费提醒；普通告警路由不受影响。")
+                return
+            kept = [item for item in self.config.expiry_notification_targets if item != target]
+            error = await self._persist_expiry_settings(kept)
+            if not error:
+                history = self.state.get("expiry_reminders")
+                if isinstance(history, dict):
+                    history.pop(target, None)
+                if target not in self._all_notification_targets():
+                    self.state.setdefault("muted", {}).pop(target, None)
+                self._save_state()
+        if error:
+            yield event.plain_result(f"❌ {error}")
+            return
+        yield event.plain_result("✅ 已解除当前会话的续费提醒绑定，普通告警/日报路由不受影响。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @kg.command("er")
+    async def cmd_expiry_routes(self, event: AstrMessageEvent):
+        """查看独立续费提醒开关、提前天数及会话。"""
+        lines = ["⏰ Komari 续费提醒", f"开关：{'已启用' if self.config.expiry_reminder_enabled else '已关闭'}",
+                 f"提前天数：{self.config.expiry_reminder_days}（每档按 24 小时计算）"]
+        for target in self.config.expiry_notification_targets:
+            lines.append(f"· {target}" + ("（无效 UMO，已忽略）" if not self._valid_umo(target) else ""))
+        if not self.config.expiry_notification_targets:
+            lines.append("尚无续费通知会话；可在目标会话发送 /kg eb。不会使用普通告警路由代发。")
+        lines.append("只读取 Komari 的到期日期；不显示费用、不自动续费。")
+        yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @kg.command("b", alias={"bind", "绑定"})
@@ -1762,6 +1960,7 @@ class KomariGuardPlugin(Star):
             return
         if target not in self._targets():
             self.state.setdefault("pending_alerts", {}).pop(target, None)
+        if target not in self._all_notification_targets():
             self.state.setdefault("muted", {}).pop(target, None)
         self._save_state()
         if removed:
@@ -1806,21 +2005,21 @@ class KomariGuardPlugin(Star):
         until = time.time() + minutes * 60
         muted = self.state.setdefault("muted", {})
         if scope_all:
-            targets = self._targets()
+            targets = self._all_notification_targets()
             if not targets:
-                yield event.plain_result("当前没有绑定任何会话，无静默对象；可先发送 /kg b 绑定。")
+                yield event.plain_result("当前没有启用的通知会话；可用 /kg b 绑定告警，或 /kg eb 绑定续费提醒。")
                 return
             for target in targets:
                 muted[target] = until
             scope_text = "全部绑定会话"
         else:
-            if event.unified_msg_origin not in self._targets():
+            if event.unified_msg_origin not in self._all_notification_targets():
                 yield event.plain_result("当前会话没有推送路由。")
                 return
             muted[event.unified_msg_origin] = until
             scope_text = "当前会话"
         self._save_state()
-        yield event.plain_result(f"🔇 已暂停{scope_text} {minutes} 分钟；告警会进入待发队列，恢复后补发。")
+        yield event.plain_result(f"🔇 已暂停{scope_text} {minutes} 分钟；普通告警排队补发，续费提醒会在恢复后的下一轮重新核对到期日。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @kg.command("um", alias={"unmute", "恢复"})
@@ -1859,9 +2058,12 @@ class KomariGuardPlugin(Star):
     @kg.command("ck", alias={"check", "检查"})
     async def cmd_check(self, event: AstrMessageEvent):
         """立即执行一次检查；告警会发往已绑定会话。"""
+        expiry_failed = await self._check_expiry_once()
         failed = await self._check_once(track_failure=False)
         if failed:
-            yield event.plain_result("❌ Komari 检查失败，请查看 AstrBot 日志中的具体原因。")
+            yield event.plain_result("❌ Komari 资源检查失败，续费检查已独立执行；请查看日志。")
+        elif expiry_failed:
+            yield event.plain_result("⚠️ 资源检查已完成，续费检查或发送未完成，将在下轮重试；请查看日志。")
         else:
             yield event.plain_result("✅ 已完成一次 Komari 检查。")
 

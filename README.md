@@ -15,7 +15,8 @@ Komari Guard 是一个面向 [AstrBot](https://github.com/AstrBotDevs/AstrBot) �
 - 查询 1-24 小时的资源与流量趋势，以及在线节点资源排行。
 - 监控节点离线、CPU/内存/磁盘超阈值、恢复、重启、长期离线和 Komari 面板不可达。
 - 通知路由可分别指定目标会话、节点、是否接收告警、每日日报时刻。
-- 同一目标的重叠路由会自动去重；发送失败或静默期间的告警进入持久待发队列。
+- 服务器到期前续费提醒可独立指定通知会话，默认提前 7、3、1 天，不与普通告警路由混用。
+- 同一目标的重叠普通告警路由会自动去重；发送失败或静默期间的普通告警进入持久待发队列。
 - WebSocket 不可用时自动使用历史记录；两条遥测通道都失败时标记为“未知”，不会批量误报离线。
 
 ## 兼容性
@@ -87,7 +88,10 @@ Komari Guard 是一个面向 [AstrBot](https://github.com/AstrBotDevs/AstrBot) �
 | `/kg top [cpu\|mem\|disk] [数量]` | 在线节点排行 | `/kg top mem 10` |
 | `/kg b [节点] [HH:MM] [模式]` | 绑定当前会话 | `/kg b web-01 09:00 both` |
 | `/kg ub [节点]` | 删除当前会话的命令路由 | `/kg ub web-01` |
-| `/kg r` | 列出所有路由 | `/kg r` |
+| `/kg r` | 列出普通告警/日报路由 | `/kg r` |
+| `/kg eb` | 绑定当前会话接收续费提醒，并启用续费检查 | `/kg eb` |
+| `/kg eu` | 解除当前会话的续费提醒绑定 | `/kg eu` |
+| `/kg er` | 查看续费提醒开关、提前天数和专用会话 | `/kg er` |
 | `/kg m [分钟] [all]` | 暂停当前或所有目标 | `/kg m 60` |
 | `/kg um [all]` | 解除暂停并补发待发告警 | `/kg um` |
 | `/kg a` | 最近 10 条告警（`alert` 也可用） | `/kg a` |
@@ -142,11 +146,44 @@ Komari Guard 是一个面向 [AstrBot](https://github.com/AstrBotDevs/AstrBot) �
 - 日报在轮询时触发，最多会比设定时刻晚一个 `poll_interval`。
 - 路由没写 `report_time` 时，使用全局 `status_report_time` 或 `status_report_interval`。
 
+## 续费提醒（独立通知会话）
+
+续费提醒使用单独的 `expiry_notification_targets` 会话列表，**不复用 `notification_routes`**。例如普通告警发到运维群，续费提醒只发给管理员私聊；两者可以分别绑定、解绑。续费通知为文本，不显示金额，也不会自动付款或续费。
+
+### 最快配置方式
+
+1. 在 Komari 中为需要提醒的服务器填写真实的到期日期（`expired_at`）。
+2. 在希望接收续费通知的私聊或群聊中，由 AstrBot 管理员发送 `/kg eb`。
+3. 用 `/kg er` 检查开关、提前天数和目标会话。绑定后刷新插件配置页，也能看到该会话条目。
+
+`/kg eb` 只开启续费提醒并加入当前会话，不创建普通告警/日报路由。默认提前天数是 `7,3,1`，不会覆盖你已自定义的天数。要停止向当前会话发续费提醒，发送 `/kg eu`；普通告警和日报不受影响。
+
+### 在配置页手动设置
+
+- **启用服务器续费提醒**（`expiry_reminder_enabled`）：默认关闭。
+- **续费提醒提前天数**（`expiry_reminder_days`）：例如 `14,7,3,1`，支持英文/中文逗号，每项为 1–365 的整数。
+- **续费提醒专用通知会话**（`expiry_notification_targets`）：可添加多个完整 UMO，不能只写群号或 QQ 号。列表为空时不发送，也不会改用普通告警会话。
+
+专用会话接收通过全局 `filter_mode` / `filter_nodes` 筛选的服务器提醒，不继承普通路由的节点选择。仅配置续费会话、不配置普通告警路由，也可以正常运行。
+
+### 触发与去重规则
+
+- 每轮监控独立读取 Komari 节点列表，不依赖 WebSocket、历史遥测或节点在线状态。面板节点接口不可用时下轮重试，不使用旧到期日盲发。
+- 提前 N 天指到期前 **N × 24 小时**。第一次检查已经只剩 2 天时，只发“3 天档”，不会连发错过的“7 天档”；进入 1 天内再提醒一次。
+- 通知中的到期时刻使用 AstrBot 宿主本地时间，并附 UTC 偏移量；检查频率沿用 `poll_interval`，并非整点调度。
+- 同一会话、同一节点、同一到期日期，每个提醒阶段成功发送后记录到插件数据目录，正常重启不会重复推送。
+- 续费后请在 Komari 更新到期日期，新日期会重新计时。没有有效到期日期、已过期的节点不发送到期前提醒。
+- 发送失败时不标记成功，下轮重新读取最新到期日后重试；已续费或已过期的旧提醒不会补发。
+- `/kg m` / `/kg um` 同时控制当前会话的普通推送与续费提醒，`all` 覆盖两类已启用会话。续费提醒解除静默后在下一轮重新核对日期，只发送当前应提醒的档位。
+
 ## 主要配置
 
 | 配置 | 默认值 | 说明 |
 | --- | ---: | --- |
 | `notification_routes` | `[]` | 指定目标 UMO、节点、告警和日报 |
+| `expiry_reminder_enabled` | `false` | 开启到期前续费提醒 |
+| `expiry_reminder_days` | `7,3,1` | 自定义提前天数，按 N×24 小时计算 |
+| `expiry_notification_targets` | `[]` | 独立续费通知 UMO 列表，不继承普通路由 |
 | `poll_interval` | `60` | 轮询秒数 |
 | `offline_grace_cycles` | `2` | 离线连续确认次数 |
 | `cpu_threshold` | `90` | CPU 告警阈值（%） |
@@ -206,6 +243,7 @@ Komari Guard 是一个面向 [AstrBot](https://github.com/AstrBotDevs/AstrBot) �
 python -m pip install -r requirements.txt
 python test_smoke.py
 python -m unittest test_cards test_card_render test_network_probe
+python -m unittest test_expiry_reminder test_expiry_integration
 ```
 
 回归套件覆盖指标解析、遥测三态、路由隔离与去重、待发重试、静默补发、独立日报进度、命令签名、图片裁切、三网解析与缓存，以及 AstrBot `chain_result` 契约。CI 在 Python 3.10、3.12、3.13 上执行。

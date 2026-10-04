@@ -694,13 +694,14 @@ async def run() -> None:
     check("metadata renamed", "astrbot_plugin_komari_guard" in metadata and "astrbot_plugin_komari_watch" not in metadata)
 
 
-with tempfile.TemporaryDirectory(prefix="komari-guard-test-") as temp_dir:
-    StarTools.data_dir = Path(temp_dir)
-    asyncio.run(run())
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory(prefix="komari-guard-test-") as temp_dir:
+        StarTools.data_dir = Path(temp_dir)
+        asyncio.run(run())
 
-print(f"PASS {len(PASS)} / FAIL {len(FAIL)}")
-if FAIL:
-    print("FAILED:")
-    for item in FAIL:
-        print(" -", item)
-    raise SystemExit(1)
+    print(f"PASS {len(PASS)} / FAIL {len(FAIL)}")
+    if FAIL:
+        print("FAILED:")
+        for item in FAIL:
+            print(" -", item)
+        raise SystemExit(1)
